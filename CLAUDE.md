@@ -105,7 +105,9 @@ Points where the API shapes this project's design:
 
 ## Agent runtime
 
-`src/lib/genai/` — `client.ts` (tiers, pricing, usage normalization), `embeddings.ts`, `orchestrator.ts` (the engine).
+`src/lib/genai/` — `client.ts` (tiers, pricing, usage normalization), `embeddings.ts`, `orchestrator.ts` (the engine), `report.ts` (the deliverable assembler).
+
+At completion `buildRunReport()` assembles every completed node into one Markdown document and stores it as `agent_graph_executions.final_output` (`{ version, title, steps, sections, totals, markdown }`); the DAG tab renders it above the node grid. Assembly is deterministic — no synthesis call, so every line traces to the node that produced it and the end of a run costs nothing extra. It reads back from the database rather than in-memory state, so a resumed run includes its pre-pause steps and a human override lands in the document. Nodes are ordered by `depends_on`, not `created_at`: a whole plan is inserted in one statement and shares a timestamp to the microsecond, so `created_at` alone orders sections arbitrarily.
 
 `launchGraph()` plans with the cheap tier, **persists every node upfront as `pending`**, then `executePending()` runs them in dependency order. `resumeGraph()` calls the same `executePending()` after a gate is resolved — that shared engine is the reason the plan is persisted before any of it runs, and it's what makes resume a continuation rather than a replay. Conversational continuity comes from `previous_interaction_id`, taken from the last completed node's stored `interaction_id`.
 
@@ -122,6 +124,10 @@ Order per node, and the order matters:
 3. **Semantic cache** — keyed on the *masked* text, scoped per workspace. A cross-tenant hit would leak one customer's output to another.
 4. **Structural validation** — `response_format` constrains shape but doesn't guarantee it; truncated or refused responses still need catching.
 5. **Critic** (`reviewOutput`) — cheap tier, billed as `critic_gate`. Runs only when output is otherwise committable; a node already heading to a human doesn't need a second opinion. Deliberately *not* chained to the worker's interaction — independent context is the point. Fails closed: if the critic errors, the node escalates.
+
+   The critic judges two kinds of claim differently: anything specific about **this customer** (records, figures, accounts, people) must trace to the supplied context, while **general professional knowledge** may come from the model. That split exists because there is no retrieval layer yet — `retrievalAvailable` is hard-wired `false` in the orchestrator. A critic asked to verify every claim against an always-empty context flags every substantive output, which is exactly what happened the moment workers started returning real content. The gate is genuinely narrower until Pillar 5 lands; flip the flag when it does.
+
+**Worker output shape.** `WORKER_SCHEMA.result` declares `heading` / `content_markdown` / `key_findings` / `data`. Structured output only ever emits keys the schema declares, so the earlier bare `{ type: "object" }` produced `result: {}` on every node — runs "completed" carrying nothing but their own one-line summaries. If you add a field to a worker's output, declare it or it will silently not exist.
 
 Two things that look like bugs but aren't:
 

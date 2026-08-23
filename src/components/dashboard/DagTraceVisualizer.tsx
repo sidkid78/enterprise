@@ -4,6 +4,8 @@ import { useState } from "react";
 
 import type { DagNode, GraphExecution } from "@/lib/data/dag";
 
+import JsonView from "./JsonView";
+
 function StatusBadge({ status }: { status: DagNode["status"] }) {
   const styles: Record<DagNode["status"], string> = {
     completed:
@@ -28,6 +30,20 @@ function StatusBadge({ status }: { status: DagNode["status"] }) {
   );
 }
 
+/**
+ * The prose deliverable inside a node's `result`, when there is one. Returns
+ * null for payloads that are genuinely structured, which read better as a tree.
+ */
+function resultMarkdown(result: unknown): string | null {
+  if (result == null || typeof result !== "object") return null;
+  const value = result as Record<string, unknown>;
+  const body =
+    typeof value.content_markdown === "string" ? value.content_markdown : null;
+  if (!body) return null;
+  const heading = typeof value.heading === "string" ? value.heading : null;
+  return heading ? `${heading}\n\n${body}` : body;
+}
+
 export default function DagTraceVisualizer({
   executions,
 }: {
@@ -37,6 +53,8 @@ export default function DagTraceVisualizer({
     executions[0]?.id ?? null,
   );
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [deliverableOpen, setDeliverableOpen] = useState(true);
+  const [copied, setCopied] = useState(false);
 
   if (executions.length === 0) {
     return (
@@ -71,6 +89,7 @@ export default function DagTraceVisualizer({
               onChange={(event) => {
                 setActiveExecutionId(event.target.value);
                 setSelectedNodeId(null);
+                setCopied(false);
               }}
               className="rounded border border-cyan-500/20 bg-cyan-500/10 px-2 py-0.5 font-mono text-xs text-cyan-400 focus:outline-none"
             >
@@ -101,6 +120,65 @@ export default function DagTraceVisualizer({
           </div>
         </div>
       </div>
+
+      {/*
+        The deliverable comes first: it is what the run was for. The node grid
+        below is the audit trail behind it, not the answer.
+      */}
+      {execution.deliverable && (
+        <div className="mb-8 rounded-xl border border-cyan-900/60 bg-slate-950/60 backdrop-blur">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-3">
+            <button
+              type="button"
+              onClick={() => setDeliverableOpen((open) => !open)}
+              aria-expanded={deliverableOpen}
+              className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-cyan-400 hover:text-cyan-300"
+            >
+              <span
+                className={`inline-block transition-transform ${deliverableOpen ? "rotate-90" : ""}`}
+                aria-hidden="true"
+              >
+                ▸
+              </span>
+              <span>Run Deliverable</span>
+            </button>
+
+            <div className="flex items-center gap-3">
+              {execution.deliverable.cachedNodeCount > 0 && (
+                <span className="rounded border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-indigo-300">
+                  {execution.deliverable.cachedNodeCount} cached
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={async () => {
+                  // Clipboard access can be denied (insecure origin, permission
+                  // policy); a failed copy must not blank the panel.
+                  try {
+                    await navigator.clipboard.writeText(
+                      execution.deliverable!.markdown,
+                    );
+                    setCopied(true);
+                  } catch {
+                    setCopied(false);
+                  }
+                }}
+                className="rounded border border-slate-700 bg-slate-900 px-2 py-1 font-mono text-[10px] text-slate-300 hover:border-cyan-500/50 hover:text-cyan-300"
+              >
+                {copied ? "Copied" : "Copy Markdown"}
+              </button>
+            </div>
+          </div>
+
+          {deliverableOpen && (
+            <div className="max-h-128 overflow-auto px-5 py-4">
+              <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-slate-300">
+                {execution.deliverable.markdown}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
 
       {/*
         The mock drew fixed SVG connector paths between exactly four evenly
@@ -179,6 +257,43 @@ export default function DagTraceVisualizer({
           <p className="mb-4 whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-900 p-4 font-mono text-xs leading-relaxed text-slate-300">
             {selectedNode.outputSnippet}
           </p>
+
+          {/*
+            The work product itself. Previously only the one-line summary was
+            rendered, so a completed run gave no way to see what it actually
+            produced — the reason to run it at all.
+          */}
+          {selectedNode.result != null && (
+            <div className="mb-4">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-cyan-400">
+                  Work Product
+                </span>
+                {selectedNode.fromCache && (
+                  <span className="rounded border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-indigo-300">
+                    Served from cache
+                  </span>
+                )}
+              </div>
+              <div className="max-h-96 overflow-auto rounded-lg border border-cyan-900/50 bg-[#0d1117] p-4">
+                {/*
+                  Workers write the deliverable into `content_markdown`. Piping
+                  a long prose string through the JSON view renders it as one
+                  escaped line, so prose is shown as prose and only genuinely
+                  structured payloads (or a human override) get the tree.
+                */}
+                {resultMarkdown(selectedNode.result) ? (
+                  <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-slate-300">
+                    {resultMarkdown(selectedNode.result)}
+                  </pre>
+                ) : (
+                  <pre className="font-mono text-[11px] leading-relaxed">
+                    <JsonView value={selectedNode.result} />
+                  </pre>
+                )}
+              </div>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 gap-4 text-xs sm:grid-cols-3">
             <div className="rounded-lg border border-slate-800/80 bg-slate-900/50 p-3">

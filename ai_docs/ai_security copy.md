@@ -989,9 +989,8 @@ export async function POST(req: NextRequest) {
 | **Gate 1: PII Masking** | `lib/governance/guardrails.ts` | Regex masking engine for Email, SSN, Credit Cards, API Keys |
 | **Gate 2: Structural Schema** | `lib/governance/guardrails.ts` | Schema key verification & structural validation |
 | **Gate 3: Critic Guard** | `lib/governance/guardrails.ts` | Groundedness check via `gemini-3.5-flash-lite` critic |
-| **Semantic Caching** | `lib/finops/cache.ts` | `text-embedding-004` (768-dim) cosine search via `pgvector` |
+| **Semantic Caching** | `lib/finops/cache.ts` | `gemini-embedding-001` (768-dim) cosine search via `pgvector` |
 | **Model Cascade Router** | `lib/finops/cascade.ts` | Tiered model mapping (`gemini-3.5-flash-lite` / `gemini-3.7-flash` / `gemini-3.1-pro-preview`) |
 | **Runaway Loop Guard** | `lib/finops/cascade.ts` | Max iteration limit & budget check |
 | **Immutable DAG Ledger** | `lib/governance/ledger.ts` | Append-only log with PostgreSQL SHA-256 trigger integration |
 
-**Metadata:**

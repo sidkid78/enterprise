@@ -6,8 +6,15 @@ import { embedText } from "./embeddings";
 
 type Db = ReturnType<typeof createServiceClient>;
 
-/** Cosine similarity above which a cached response is reused verbatim. */
-export const CACHE_SIMILARITY_THRESHOLD = 0.92;
+/**
+ * Cosine similarity above which a cached response is reused verbatim.
+ *
+ * 0.97, not the blueprint's 0.92: at 0.92 sibling nodes within one run matched
+ * each other and the cache served one node's output for four distinct steps.
+ * For agent steps a wrong hit silently fabricates work, so only near-identical
+ * inputs qualify.
+ */
+export const CACHE_SIMILARITY_THRESHOLD = 0.97;
 
 export type CacheHit = {
   id: string;
@@ -31,6 +38,8 @@ export async function lookupCache(
   db: Db,
   workspaceId: string,
   maskedInput: string,
+  /** The running graph. Its own entries are never served back to it. */
+  excludeGraphId?: string,
 ): Promise<CacheHit | null> {
   try {
     const embedding = await embedText(maskedInput);
@@ -40,6 +49,7 @@ export async function lookupCache(
       p_query_embedding: embedding,
       p_similarity_threshold: CACHE_SIMILARITY_THRESHOLD,
       p_limit: 1,
+      p_exclude_graph_id: excludeGraphId ?? null,
     });
 
     if (error || !data || data.length === 0) return null;
@@ -79,6 +89,7 @@ export async function storeCache(
     maskedInput: string;
     responsePayload: Record<string, unknown>;
     modelUsed: string;
+    graphExecutionId: string;
     ttlHours?: number;
   },
 ): Promise<void> {
@@ -94,6 +105,7 @@ export async function storeCache(
       query_embedding: embedding,
       response_payload: params.responsePayload,
       model_used: params.modelUsed,
+      graph_execution_id: params.graphExecutionId,
       expires_at: expiresAt,
     });
   } catch {

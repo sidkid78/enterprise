@@ -6,6 +6,7 @@ import { maskPii } from "@/lib/governance/pii";
 import { createServiceClient } from "@/lib/supabase/service";
 
 import { lookupCache, storeCache } from "./cache";
+import { buildRunReport } from "./report";
 import {
   MODEL_TIERS,
   ROUTING_TIER_LABEL,
@@ -85,7 +86,48 @@ const WORKER_SCHEMA = {
       type: "number",
       description: "0-1 confidence this output is correct and safe to commit.",
     },
-    result: { type: "object", description: "The structured work product." },
+    /*
+     * `result` was previously declared as a bare `{ type: "object" }` with no
+     * properties. Structured output only emits keys the schema declares, so the
+     * model had nowhere to write and every node returned `result: {}` — runs
+     * completed carrying nothing but their own one-line summaries. The shape
+     * below is deliberately generic enough for any agent role while still
+     * giving the deliverable a declared home.
+     */
+    result: {
+      type: "object",
+      description: "The structured work product.",
+      properties: {
+        heading: {
+          type: "string",
+          description: "Short title for this work product.",
+        },
+        content_markdown: {
+          type: "string",
+          description:
+            "The complete work product itself, written out in full as Markdown. This is the deliverable, not a description of one.",
+        },
+        key_findings: {
+          type: "array",
+          items: { type: "string" },
+          description: "The load-bearing points, one per entry.",
+        },
+        data: {
+          type: "array",
+          description: "Optional tabular facts backing the work product.",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string" },
+              value: { type: "string" },
+              note: { type: "string" },
+            },
+            required: ["label", "value"],
+          },
+        },
+      },
+      required: ["heading", "content_markdown"],
+    },
     risk_factors: { type: "array", items: { type: "string" } },
   },
   required: ["summary", "confidence", "result"],
@@ -293,7 +335,7 @@ async function executePending(
         ? `\n\nCompleted so far:\n${priorContext.join("\n")}`
         : "";
 
-      const rawInput = `You are ${node.agent_role}. Objective: ${objective}${context}\n\nReport your confidence honestly; low confidence routes to a human reviewer rather than counting against you.`;
+      const rawInput = `You are ${node.agent_role}. Objective: ${objective}${context}\n\nProduce the actual deliverable in result.content_markdown — the finished work itself, written out in full, not a plan or a description of what you would produce. The summary field is a one-line label for it, not a substitute.\n\nReport your confidence honestly; low confidence routes to a human reviewer rather than counting against you.`;
 
       /** Pauses the graph at this node and hands off to a human. */
       const escalate = async (params: {
@@ -399,7 +441,7 @@ async function executePending(
 
       // === FinOps: semantic cache before spending on a model call =====
       // Keyed on the masked text, so the cache never stores raw PII.
-      const cached = await lookupCache(db, workspaceId, maskedInput);
+      const cached = await lookupCache(db, workspaceId, maskedInput, graphId);
 
       let output: WorkerOutput | null;
       let usage = { inputTokens: 0, outputTokens: 0, cachedTokens: 0 };
@@ -496,6 +538,9 @@ async function executePending(
           objective,
           context: priorContext.join("\n"),
           output: output?.result,
+          // No retrieval layer exists yet, so the only context a worker ever
+          // has is the prior steps of its own run.
+          retrievalAvailable: false,
         });
         totalCost += critic.costUsd;
 
@@ -592,18 +637,25 @@ async function executePending(
           maskedInput,
           responsePayload: output as unknown as Record<string, unknown>,
           modelUsed: model,
+          graphExecutionId: graphId,
         });
       }
 
       priorContext.push(`- ${node.node_id}: ${output!.summary}`);
     }
 
+    // The deliverable. Previously `final_output` held only the step summaries,
+    // so a finished run's actual work product was scattered across node rows
+    // with no assembled form. Built from the database, after every node has
+    // been written, so a resumed run includes its pre-pause steps.
+    const report = await buildRunReport(db, graphId);
+
     await db
       .from("agent_graph_executions")
       .update({
         status: "completed",
         completed_at: new Date().toISOString(),
-        final_output: { steps: priorContext },
+        final_output: report ?? { steps: priorContext },
       })
       .eq("id", graphId);
 

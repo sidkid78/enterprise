@@ -18,6 +18,21 @@ export type DagNode = {
   costUsd: number;
   dependencies: string[];
   outputSnippet: string;
+  /** The actual work product. Without this the UI shows only a one-line summary. */
+  result: unknown;
+  /** True when this node was served from the semantic cache (cost $0). */
+  fromCache: boolean;
+};
+
+/**
+ * The assembled deliverable written by the runtime at completion. Older runs
+ * predate it and stored only `{ steps }`, so this is null for them rather than
+ * being reconstructed — a half-built document would misrepresent the run.
+ */
+export type RunDeliverable = {
+  markdown: string;
+  generatedAt: string | null;
+  cachedNodeCount: number;
 };
 
 export type GraphExecution = {
@@ -26,6 +41,7 @@ export type GraphExecution = {
   status: string;
   rootPrompt: string;
   startedAt: string;
+  deliverable: RunDeliverable | null;
   nodes: DagNode[];
 };
 
@@ -59,6 +75,26 @@ function toSnippet(raw: unknown): string {
 }
 
 /**
+ * `final_output` is jsonb, so its shape is not enforced by the schema. Accept
+ * only a report that actually carries rendered markdown.
+ */
+function toDeliverable(raw: unknown): RunDeliverable | null {
+  if (raw == null || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.markdown !== "string" || value.markdown.length === 0) {
+    return null;
+  }
+  const totals = (value.totals ?? {}) as Record<string, unknown>;
+  return {
+    markdown: value.markdown,
+    generatedAt:
+      typeof value.generatedAt === "string" ? value.generatedAt : null,
+    cachedNodeCount:
+      typeof totals.cachedNodeCount === "number" ? totals.cachedNodeCount : 0,
+  };
+}
+
+/**
  * Most recent executions with their nodes, for the DAG trace visualizer.
  *
  * Nodes are fetched in the same round trip via the FK relationship rather than
@@ -78,6 +114,7 @@ export async function getRecentExecutions(
        status,
        root_prompt,
        started_at,
+       final_output,
        agent_node_executions (
          node_id,
          agent_role,
@@ -89,6 +126,7 @@ export async function getRecentExecutions(
          cost_usd,
          depends_on,
          output_payload,
+         interaction_id,
          created_at
        )`,
     )
@@ -111,6 +149,7 @@ export async function getRecentExecutions(
     cost_usd: number | string | null;
     depends_on: string[] | null;
     output_payload: unknown;
+    interaction_id: string | null;
     created_at: string;
   };
 
@@ -120,6 +159,7 @@ export async function getRecentExecutions(
     status: string;
     root_prompt: string;
     started_at: string;
+    final_output: unknown;
     agent_node_executions: NodeRow[] | null;
   };
 
@@ -129,9 +169,16 @@ export async function getRecentExecutions(
     status: row.status,
     rootPrompt: row.root_prompt,
     startedAt: row.started_at,
+    deliverable: toDeliverable(row.final_output),
     nodes: (row.agent_node_executions ?? [])
       .slice()
-      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+      // All nodes of a plan are inserted in one statement and so share a
+      // created_at; node_id breaks the tie deterministically.
+      .sort(
+        (a, b) =>
+          a.created_at.localeCompare(b.created_at) ||
+          a.node_id.localeCompare(b.node_id),
+      )
       .map((node) => ({
         id: node.node_id,
         agentRole: node.agent_role,
@@ -144,6 +191,15 @@ export async function getRecentExecutions(
         costUsd: Number(node.cost_usd ?? 0),
         dependencies: node.depends_on ?? [],
         outputSnippet: toSnippet(node.output_payload),
+        result:
+          node.output_payload &&
+          typeof node.output_payload === "object" &&
+          "result" in node.output_payload
+            ? (node.output_payload as { result: unknown }).result
+            : null,
+        // A completed node with no interaction_id was served from cache: the
+        // runtime only records an id when it actually called the model.
+        fromCache: node.node_status === "completed" && !node.interaction_id,
       })),
   }));
 }

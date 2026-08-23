@@ -54,13 +54,21 @@ export async function signUp(
   }
 
   const supabase = await createClient();
-  const { error } = await supabase.auth.signUp({ email, password });
+  const { data, error } = await supabase.auth.signUp({ email, password });
 
   if (error) {
     return { error: error.message };
   }
 
-  // With email confirmation enabled (the default) no session exists yet.
+  // Whether a confirmation email is required depends on the project's
+  // `enable_confirmations` setting, which differs between the local stack
+  // (off by default) and a hosted project (on). Branch on what the response
+  // actually contains rather than assuming — telling someone to check mail
+  // that was never sent is worse than no message at all.
+  if (data.session) {
+    redirect(safeNext(formData.get("next")));
+  }
+
   return { error: "Check your email to confirm your account, then sign in." };
 }
 
