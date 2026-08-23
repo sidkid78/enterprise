@@ -1,0 +1,99 @@
+import "server-only";
+
+import { redirect } from "next/navigation";
+
+import { createClient } from "@/lib/supabase/server";
+
+import type { UserRole, WorkspaceSummary } from "@/lib/roles";
+
+export type { UserRole, WorkspaceSummary };
+
+/**
+ * Claims for the signed-in user, or null. Uses getClaims() — which verifies the
+ * JWT — rather than getSession(), whose user object is unverified.
+ */
+export async function getUserClaims() {
+  const supabase = await createClient();
+  const { data } = await supabase.auth.getClaims();
+  return data?.claims ?? null;
+}
+
+/**
+ * Every workspace the signed-in user belongs to, with their role in each.
+ * RLS restricts this to the caller's own memberships.
+ */
+export async function getUserWorkspaces(): Promise<WorkspaceSummary[]> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase
+    .from("workspace_members")
+    .select("role, workspaces!inner(id, name, slug, enterprise_tier, is_active)")
+    .eq("workspaces.is_active", true);
+
+  if (error) {
+    throw new Error(`Failed to load workspaces: ${error.message}`);
+  }
+
+  type WorkspaceRow = {
+    id: string;
+    name: string;
+    slug: string;
+    enterprise_tier: string;
+  };
+
+  type Row = {
+    role: UserRole;
+    // PostgREST embeds a to-one relation as an object, but the generated
+    // typings widen it to an array. Accept both and normalize.
+    workspaces: WorkspaceRow | WorkspaceRow[] | null;
+  };
+
+  return ((data ?? []) as unknown as Row[]).flatMap((row) => {
+    const workspace = Array.isArray(row.workspaces)
+      ? row.workspaces[0]
+      : row.workspaces;
+
+    // A membership whose workspace was filtered out by the is_active join
+    // yields no row rather than a card with undefined fields.
+    if (!workspace) return [];
+
+    return [
+      {
+        id: workspace.id,
+        name: workspace.name,
+        slug: workspace.slug,
+        enterpriseTier: workspace.enterprise_tier,
+        role: row.role,
+      },
+    ];
+  });
+}
+
+/**
+ * Resolves the workspace a dashboard request should render.
+ *
+ * `requested` comes from a query param, so it is never trusted directly — it is
+ * only honoured if it appears in the caller's own membership list. Falls back
+ * to the first workspace otherwise.
+ *
+ * Redirects to /login when unauthenticated and to /onboarding when the user has
+ * no workspace at all, so callers can treat the result as always present.
+ */
+export async function resolveActiveWorkspace(requested?: string): Promise<{
+  active: WorkspaceSummary;
+  all: WorkspaceSummary[];
+}> {
+  const claims = await getUserClaims();
+  if (!claims) {
+    redirect("/login");
+  }
+
+  const all = await getUserWorkspaces();
+  if (all.length === 0) {
+    redirect("/onboarding");
+  }
+
+  const active = all.find((w) => w.id === requested) ?? all[0];
+  return { active, all };
+}
+

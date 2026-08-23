@@ -1,146 +1,168 @@
-'use client';
+import Link from "next/link";
 
-import React, { useState } from 'react';
-import HitlQueueDashboard from '@/components/dashboard/HitlQueueDashboard';
-import DagTraceVisualizer from '@/components/dashboard/DagTraceVisualizer';
-import WorkforceUpskillingHub from '@/components/dashboard/WorkforceUpskillingHub';
-import BioRoiCommercialization from '@/components/dashboard/BioRoiCommercialization';
+import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercialization";
+import DagTraceVisualizer from "@/components/dashboard/DagTraceVisualizer";
+import HitlQueueDashboard from "@/components/dashboard/HitlQueueDashboard";
+import LaunchRunForm from "@/components/dashboard/LaunchRunForm";
+import WorkforceUpskillingHub from "@/components/dashboard/WorkforceUpskillingHub";
+import WorkspaceSwitcher from "@/components/dashboard/WorkspaceSwitcher";
+import { signOut } from "@/app/login/actions";
+import { getRoiSummary } from "@/lib/data/bio";
+import { countActiveExecutions, getRecentExecutions } from "@/lib/data/dag";
+import { countPendingGates, getPendingGates } from "@/lib/data/hitl";
+import { getTrainingModules } from "@/lib/data/workforce";
+import { resolveActiveWorkspace } from "@/lib/data/workspaces";
 
-export default function EnterpriseDashboardPage() {
-  const [activeTab, setActiveTab] = useState<'hitl' | 'dag' | 'upskilling' | 'bio'>('hitl');
-  const [workspaceId, setWorkspaceId] = useState<string>('ws_ent_9832_prod');
-  const [stats, setStats] = useState({
-    pendingHitlCount: 3,
-    activeDagRuns: 2,
-    totalDeflectedCostUsd: 142850.00,
-    slaUptimePercentage: 99.98,
-  });
+const TABS = [
+  { key: "hitl", label: "HITL Decision Queue" },
+  { key: "dag", label: "DAG Execution Visualizer" },
+  { key: "upskilling", label: "Workforce Enablement & SOPs" },
+  { key: "bio", label: "BIO ROI & SLA Billing" },
+] as const;
+
+type TabKey = (typeof TABS)[number]["key"];
+
+function toTab(raw: string | string[] | undefined): TabKey {
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return TABS.some((t) => t.key === value) ? (value as TabKey) : "hitl";
+}
+
+export default async function EnterpriseDashboardPage({
+  searchParams,
+}: PageProps<"/dashboard">) {
+  const params = await searchParams;
+  const tab = toTab(params.tab);
+  const requestedWorkspace = Array.isArray(params.workspace)
+    ? params.workspace[0]
+    : params.workspace;
+
+  // Redirects to /login or /onboarding when there is no usable workspace.
+  const { active, all } = await resolveActiveWorkspace(requestedWorkspace);
+
+  // Header counters are always shown, so they load regardless of active tab.
+  const [pendingHitlCount, activeDagRuns, roi] = await Promise.all([
+    countPendingGates(active.id),
+    countActiveExecutions(active.id),
+    getRoiSummary(active.id),
+  ]);
+
+  const tabHref = (key: TabKey) =>
+    `/dashboard?tab=${key}&workspace=${active.id}`;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans antialiased selection:bg-cyan-500 selection:text-slate-950">
-      {/* Top Enterprise Header */}
-      <header className="border-b border-slate-800 bg-slate-900/60 backdrop-blur-md sticky top-0 z-40">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+    <div className="min-h-screen bg-slate-950 font-sans text-slate-100 antialiased selection:bg-cyan-500 selection:text-slate-950">
+      <header className="sticky top-0 z-40 border-b border-slate-800 bg-slate-900/60 backdrop-blur-md">
+        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6 lg:px-8">
           <div className="flex items-center space-x-3">
-            <div className="h-9 w-9 rounded-lg bg-gradient-to-tr from-cyan-500 via-indigo-500 to-purple-600 flex items-center justify-center font-bold text-slate-950 text-xl shadow-lg shadow-cyan-500/20">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-tr from-cyan-500 via-indigo-500 to-purple-600 text-xl font-bold text-slate-950 shadow-lg shadow-cyan-500/20">
               Æ
             </div>
             <div>
               <div className="flex items-center space-x-2">
-                <h1 className="font-bold text-lg text-white tracking-tight">Enterprise AgentOps</h1>
-                <span className="px-2 py-0.5 text-[10px] font-semibold bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 rounded-full uppercase tracking-wider">
-                  2026 SLA Tier 1
+                <h1 className="text-lg font-bold tracking-tight text-white">
+                  Enterprise AgentOps
+                </h1>
+                <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-cyan-400">
+                  {active.enterpriseTier.replaceAll("_", " ")}
                 </span>
               </div>
-              <p className="text-xs text-slate-400">Multi-Agent Orchestration & Governance Control Plane</p>
+              <p className="text-xs text-slate-400">
+                Multi-Agent Orchestration &amp; Governance Control Plane
+              </p>
             </div>
           </div>
 
-          {/* Quick Metrics Bar */}
-          <div className="hidden lg:flex items-center space-x-6">
+          <div className="hidden items-center space-x-6 lg:flex">
             <div className="flex items-center space-x-2">
-              <div className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse"></div>
+              <div className="h-2 w-2 animate-pulse rounded-full bg-emerald-400"></div>
               <span className="text-xs text-slate-400">SLA Uptime:</span>
-              <span className="text-xs font-mono font-semibold text-emerald-400">{stats.slaUptimePercentage}%</span>
+              <span className="font-mono text-xs font-semibold text-emerald-400">
+                {roi.uptimeSlaActual.toFixed(2)}%
+              </span>
             </div>
             <div className="h-4 w-px bg-slate-800"></div>
             <div className="text-xs">
               <span className="text-slate-400">Deflected Cost: </span>
-              <span className="font-mono font-bold text-cyan-400">${stats.totalDeflectedCostUsd.toLocaleString('en-US', { minimumFractionDigits: 2 })}</span>
+              <span className="font-mono font-bold text-cyan-400">
+                $
+                {roi.totalDeflectedCostUsd.toLocaleString("en-US", {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2,
+                })}
+              </span>
             </div>
             <div className="h-4 w-px bg-slate-800"></div>
-            <div className="flex items-center space-x-2">
-              <span className="text-xs text-slate-400">Active Tenant:</span>
-              <select 
-                value={workspaceId} 
-                onChange={(e) => setWorkspaceId(e.target.value)}
-                className="bg-slate-900 border border-slate-700 text-xs rounded px-2 py-1 text-slate-200 focus:outline-none focus:border-cyan-500"
+            <WorkspaceSwitcher workspaces={all} activeId={active.id} />
+            <form action={signOut}>
+              <button
+                type="submit"
+                className="text-xs text-slate-400 transition-colors hover:text-slate-200"
               >
-                <option value="ws_ent_9832_prod">Acme Corp Enterprise</option>
-                <option value="ws_global_fintech">GlobalFinTech SLA</option>
-                <option value="ws_health_care_plus">HealthCare Plus (HIPAA)</option>
-              </select>
-            </div>
+                Sign out
+              </button>
+            </form>
           </div>
         </div>
       </header>
 
-      {/* Main Content Area */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Navigation Tabs */}
-        <div className="border-b border-slate-800 mb-8">
+      <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
+        <div className="mb-8 border-b border-slate-800">
           <nav className="flex space-x-8" aria-label="Tabs">
-            <button
-              onClick={() => setActiveTab('hitl')}
-              className={`pb-4 px-1 border-b-2 font-medium text-sm flex items-center space-x-2 transition-colors ${
-                activeTab === 'hitl'
-                  ? 'border-cyan-500 text-cyan-400'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-700'
-              }`}
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
-              </svg>
-              <span>HITL Decision Queue</span>
-              {stats.pendingHitlCount > 0 && (
-                <span className="ml-2 bg-amber-500/20 text-amber-400 text-xs font-bold px-2 py-0.5 rounded-full border border-amber-500/40">
-                  {stats.pendingHitlCount}
-                </span>
-              )}
-            </button>
-
-            <button
-              onClick={() => setActiveTab('dag')}
-              className={`pb-4 px-1 border-b-2 font-medium text-sm flex items-center space-x-2 transition-colors ${
-                activeTab === 'dag'
-                  ? 'border-cyan-500 text-cyan-400'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-700'
-              }`}
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10a2 2 0 002 2h2a2 2 0 002-2M9 7a2 2 0 012-2h2a2 2 0 012 2m0 10V7m0 10a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2"/>
-              </svg>
-              <span>DAG Execution Visualizer</span>
-              <span className="ml-1 bg-cyan-500/10 text-cyan-400 text-xs px-2 py-0.5 rounded-full border border-cyan-500/30">
-                {stats.activeDagRuns} Live
-              </span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('upskilling')}
-              className={`pb-4 px-1 border-b-2 font-medium text-sm flex items-center space-x-2 transition-colors ${
-                activeTab === 'upskilling'
-                  ? 'border-cyan-500 text-cyan-400'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-700'
-              }`}
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"/>
-              </svg>
-              <span>Workforce Enablement & SOPs</span>
-            </button>
-
-            <button
-              onClick={() => setActiveTab('bio')}
-              className={`pb-4 px-1 border-b-2 font-medium text-sm flex items-center space-x-2 transition-colors ${
-                activeTab === 'bio'
-                  ? 'border-cyan-500 text-cyan-400'
-                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:border-slate-700'
-              }`}
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"/>
-              </svg>
-              <span>BIO ROI & SLA Billing</span>
-            </button>
+            {TABS.map(({ key, label }) => {
+              const isActive = key === tab;
+              return (
+                <Link
+                  key={key}
+                  href={tabHref(key)}
+                  aria-current={isActive ? "page" : undefined}
+                  className={`flex items-center space-x-2 border-b-2 px-1 pb-4 text-sm font-medium transition-colors ${
+                    isActive
+                      ? "border-cyan-500 text-cyan-400"
+                      : "border-transparent text-slate-400 hover:border-slate-700 hover:text-slate-200"
+                  }`}
+                >
+                  <span>{label}</span>
+                  {key === "hitl" && pendingHitlCount > 0 && (
+                    <span className="ml-2 rounded-full border border-amber-500/40 bg-amber-500/20 px-2 py-0.5 text-xs font-bold text-amber-400">
+                      {pendingHitlCount}
+                    </span>
+                  )}
+                  {key === "dag" && (
+                    <span className="ml-1 rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-xs text-cyan-400">
+                      {activeDagRuns} Live
+                    </span>
+                  )}
+                </Link>
+              );
+            })}
           </nav>
         </div>
 
-        {/* Dynamic Tab Views */}
-        {activeTab === 'hitl' && <HitlQueueDashboard workspaceId={workspaceId} />}
-        {activeTab === 'dag' && <DagTraceVisualizer workspaceId={workspaceId} />}
-        {activeTab === 'upskilling' && <WorkforceUpskillingHub workspaceId={workspaceId} />}
-        {activeTab === 'bio' && <BioRoiCommercialization workspaceId={workspaceId} />}
+        {(tab === "hitl" || tab === "dag") && (
+          <LaunchRunForm workspaceId={active.id} />
+        )}
+
+        {tab === "hitl" && (
+          <HitlQueueDashboard
+            gates={await getPendingGates(active.id)}
+            viewerRole={active.role}
+          />
+        )}
+        {tab === "dag" && (
+          <DagTraceVisualizer executions={await getRecentExecutions(active.id)} />
+        )}
+        {tab === "upskilling" && (
+          <WorkforceUpskillingHub
+            workspaceName={active.name}
+            modules={await getTrainingModules(active.id)}
+          />
+        )}
+        {tab === "bio" && (
+          <BioRoiCommercialization
+            workspaceName={active.name}
+            roi={roi}
+          />
+        )}
       </main>
     </div>
   );
