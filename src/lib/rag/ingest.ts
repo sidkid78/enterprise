@@ -72,7 +72,12 @@ export async function ingestDocument(params: {
       document_title: params.title,
       source_uri: params.sourceUri ?? null,
       full_content: params.content,
-      metadata: params.metadata ?? {},
+      metadata: {
+        ...(params.metadata ?? {}),
+        // Recorded here so a document list can show size without selecting
+        // every document's full body.
+        character_count: params.content.length,
+      },
     })
     .select("id")
     .single();

@@ -20,14 +20,23 @@ export async function getUserClaims() {
 
 /**
  * Every workspace the signed-in user belongs to, with their role in each.
- * RLS restricts this to the caller's own memberships.
  */
 export async function getUserWorkspaces(): Promise<WorkspaceSummary[]> {
   const supabase = await createClient();
 
+  const claims = await getUserClaims();
+  const userId = claims?.sub;
+  if (!userId) return [];
+
   const { data, error } = await supabase
     .from("workspace_members")
     .select("role, workspaces!inner(id, name, slug, enterprise_tier, is_active)")
+    // Filter by user explicitly. The workspace_members SELECT policy is
+    // `is_workspace_member(workspace_id)` — correct, because a member may see
+    // the roster — which means RLS alone returns one row per MEMBER, not per
+    // membership of the caller. Relying on it here listed a workspace once per
+    // colleague and attached whichever member's `role` came back first.
+    .eq("user_id", userId)
     .eq("workspaces.is_active", true);
 
   if (error) {

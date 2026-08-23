@@ -38,12 +38,16 @@ export async function launchRun(
     return { error: "Not signed in.", message: null };
   }
 
-  // RLS restricts this to the caller's own memberships, so a row coming back
-  // proves membership of the requested workspace.
+  // Filter by user_id explicitly rather than leaning on RLS. The
+  // workspace_members SELECT policy is `is_workspace_member(workspace_id)`, so
+  // it returns a row per MEMBER of the workspace — in a workspace with two
+  // members maybeSingle() then failed and told an actual member "you are not a
+  // member of this workspace".
   const { data: membership } = await supabase
     .from("workspace_members")
     .select("role")
     .eq("workspace_id", workspaceId)
+    .eq("user_id", userId)
     .maybeSingle();
 
   if (!membership) {

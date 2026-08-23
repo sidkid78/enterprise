@@ -1,6 +1,7 @@
 import Link from "next/link";
 
 import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercialization";
+import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
 import DagTraceVisualizer from "@/components/dashboard/DagTraceVisualizer";
 import HitlQueueDashboard from "@/components/dashboard/HitlQueueDashboard";
 import LaunchRunForm from "@/components/dashboard/LaunchRunForm";
@@ -10,12 +11,17 @@ import { signOut } from "@/app/login/actions";
 import { getRoiSummary } from "@/lib/data/bio";
 import { countActiveExecutions, getRecentExecutions } from "@/lib/data/dag";
 import { countPendingGates, getPendingGates } from "@/lib/data/hitl";
+import {
+  getKnowledgeBases,
+  getKnowledgeDocuments,
+} from "@/lib/data/knowledge";
 import { getTrainingModules } from "@/lib/data/workforce";
 import { resolveActiveWorkspace } from "@/lib/data/workspaces";
 
 const TABS = [
   { key: "hitl", label: "HITL Decision Queue" },
   { key: "dag", label: "DAG Execution Visualizer" },
+  { key: "knowledge", label: "Domain Knowledge" },
   { key: "upskilling", label: "Workforce Enablement & SOPs" },
   { key: "bio", label: "BIO ROI & SLA Billing" },
 ] as const;
@@ -150,6 +156,13 @@ export default async function EnterpriseDashboardPage({
         )}
         {tab === "dag" && (
           <DagTraceVisualizer executions={await getRecentExecutions(active.id)} />
+        )}
+        {tab === "knowledge" && (
+          <KnowledgeBaseHub
+            workspaceId={active.id}
+            bases={await getKnowledgeBases(active.id)}
+            documents={await getKnowledgeDocuments(active.id)}
+          />
         )}
         {tab === "upskilling" && (
           <WorkforceUpskillingHub
