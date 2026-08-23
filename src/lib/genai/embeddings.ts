@@ -32,27 +32,72 @@ function l2Normalize(vector: number[]): number[] {
 }
 
 /**
- * Embeds text for the semantic cache, returning a unit-length 768-dim vector.
+ * What the embedding will be used for.
+ *
+ * `RETRIEVAL_DOCUMENT` and `RETRIEVAL_QUERY` are an asymmetric pair — the model
+ * places a passage and a question that passage answers near each other, which
+ * is not the same geometry as two texts that merely resemble each other.
+ * Embedding a corpus as `SEMANTIC_SIMILARITY` and then querying it measurably
+ * degrades recall, so the two RAG paths must each pass their own.
  */
-export async function embedText(text: string): Promise<number[]> {
+export type EmbeddingTask =
+  | "SEMANTIC_SIMILARITY"
+  | "RETRIEVAL_DOCUMENT"
+  | "RETRIEVAL_QUERY";
+
+/**
+ * Embeds one text, returning a unit-length 768-dim vector.
+ *
+ * Defaults to `SEMANTIC_SIMILARITY` because the semantic cache compares two
+ * prompts to each other, which is symmetric.
+ */
+export async function embedText(
+  text: string,
+  task: EmbeddingTask = "SEMANTIC_SIMILARITY",
+): Promise<number[]> {
+  const [vector] = await embedBatch([text], task);
+  return vector;
+}
+
+/**
+ * Embeds several texts in one call.
+ *
+ * Ingestion produces many chunks per document; one request per chunk is both
+ * slower and far more likely to hit a rate limit than one request carrying the
+ * batch.
+ */
+export async function embedBatch(
+  texts: string[],
+  task: EmbeddingTask = "SEMANTIC_SIMILARITY",
+): Promise<number[][]> {
+  if (texts.length === 0) return [];
+
   const client = getGenAI();
 
   const response = await client.models.embedContent({
     model: EMBEDDING_MODEL,
-    contents: text,
+    contents: texts,
     config: {
       outputDimensionality: EMBEDDING_DIMENSIONS,
-      taskType: "SEMANTIC_SIMILARITY",
+      taskType: task,
     },
   });
 
-  const values = response.embeddings?.[0]?.values;
+  const embeddings = response.embeddings ?? [];
 
-  if (!values || values.length !== EMBEDDING_DIMENSIONS) {
+  if (embeddings.length !== texts.length) {
     throw new Error(
-      `Expected a ${EMBEDDING_DIMENSIONS}-dim embedding, got ${values?.length ?? "none"}.`,
+      `Expected ${texts.length} embeddings, got ${embeddings.length}.`,
     );
   }
 
-  return l2Normalize(values);
+  return embeddings.map((embedding, index) => {
+    const values = embedding.values;
+    if (!values || values.length !== EMBEDDING_DIMENSIONS) {
+      throw new Error(
+        `Expected a ${EMBEDDING_DIMENSIONS}-dim embedding at index ${index}, got ${values?.length ?? "none"}.`,
+      );
+    }
+    return l2Normalize(values);
+  });
 }

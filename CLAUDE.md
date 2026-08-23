@@ -113,6 +113,19 @@ At completion `buildRunReport()` assembles every completed node into one Markdow
 
 A node escalates when the worker self-reports confidence below `CONFIDENCE_THRESHOLD` (0.7) or returns unparseable JSON. Workers are instructed never to fabricate missing data and to report low confidence instead — in testing that correctly routed an un-runnable step to a human rather than inventing SAP records.
 
+## Retrieval (Pillar 5)
+
+`src/lib/rag/` — `chunk.ts` (pure, no `server-only`, safe to import from a Client Component), `ingest.ts`, `retrieve.ts`.
+
+Parent/child: chunks are embedded small so retrieval is precise, and what the worker actually reads is the **parent document**, so it gets context a short chunk cannot carry. `hybrid_search_knowledge_chunks` fuses dense (HNSW cosine) and sparse (`tsvector` + GIN) arms by **Reciprocal Rank Fusion on rank, never on raw score** — cosine distance and `ts_rank_cd` are on incomparable scales.
+
+- **The blueprint's version of that RPC is `SECURITY DEFINER`; ours is `SECURITY INVOKER`, granted to `service_role` only.** DEFINER bypasses RLS, so any authenticated caller could pass another workspace's id and read its documents. As with `launchGraph`, the caller must verify membership itself.
+- **Embedding task types are asymmetric and must match.** Corpus is embedded `RETRIEVAL_DOCUMENT`, queries `RETRIEVAL_QUERY`; the semantic cache stays `SEMANTIC_SIMILARITY` because comparing two prompts is symmetric. Mixing them degrades recall silently.
+- **Chunks are PII-masked before embedding; `full_content` is stored raw.** Embedding is a call to the provider and is retained server-side, so the retrievable copy must be clean. The parent is local, RLS-protected, and is what a reviewer needs to read. Same boundary as `root_prompt`.
+- `retrieveContext` **never throws** — retrieval failing is a degraded answer, not a failed run. The critic is told separately whether retrieval actually happened, so an empty result can't be mistaken for "the knowledge base says nothing relevant".
+- Retrieval is keyed on each node's **objective**, not the root prompt: every step asks a different question, and retrieving once up front would defeat the plan.
+- `fts_tokens` casts the regconfig explicitly (`'pg_catalog.english'::regconfig`) — the one-argument `to_tsvector` is only STABLE and a generated column requires IMMUTABLE.
+
 ## Governance gates
 
 `src/lib/governance/` — `pii.ts`, `injection.ts`, `critic.ts`. Every gate writes a `guardrail_events` row.

@@ -5,6 +5,8 @@ import { screenForInjection } from "@/lib/governance/injection";
 import { maskPii } from "@/lib/governance/pii";
 import { createServiceClient } from "@/lib/supabase/service";
 
+import { retrieveContext } from "@/lib/rag/retrieve";
+
 import { lookupCache, storeCache } from "./cache";
 import { buildRunReport } from "./report";
 import {
@@ -331,11 +333,29 @@ async function executePending(
         .update({ node_status: "running" })
         .eq("id", node.id);
 
-      const context = priorContext.length
-        ? `\n\nCompleted so far:\n${priorContext.join("\n")}`
+      // Grounding. Retrieval is keyed on the objective, not the root prompt:
+      // each step asks a different question of the knowledge base, and a plan
+      // whose steps all retrieved the same passages would be no better than
+      // retrieving once up front.
+      const retrieval = await retrieveContext({
+        workspaceId,
+        query: objective,
+      });
+
+      const context = [
+        retrieval.context
+          ? `\n\nFrom the workspace knowledge base:\n${retrieval.context}`
+          : "",
+        priorContext.length
+          ? `\n\nCompleted so far:\n${priorContext.join("\n")}`
+          : "",
+      ].join("");
+
+      const grounding = retrieval.chunks.length
+        ? "\n\nGround every customer-specific claim in the knowledge base excerpts above, and say so plainly when they do not cover something rather than filling the gap."
         : "";
 
-      const rawInput = `You are ${node.agent_role}. Objective: ${objective}${context}\n\nProduce the actual deliverable in result.content_markdown — the finished work itself, written out in full, not a plan or a description of what you would produce. The summary field is a one-line label for it, not a substitute.\n\nReport your confidence honestly; low confidence routes to a human reviewer rather than counting against you.`;
+      const rawInput = `You are ${node.agent_role}. Objective: ${objective}${context}${grounding}\n\nProduce the actual deliverable in result.content_markdown — the finished work itself, written out in full, not a plan or a description of what you would produce. The summary field is a one-line label for it, not a substitute.\n\nReport your confidence honestly; low confidence routes to a human reviewer rather than counting against you.`;
 
       /** Pauses the graph at this node and hands off to a human. */
       const escalate = async (params: {
@@ -536,11 +556,14 @@ async function executePending(
       if (structurallyValid && confidence >= CONFIDENCE_THRESHOLD && !cached) {
         critic = await reviewOutput({
           objective,
-          context: priorContext.join("\n"),
+          // The critic judges against exactly what the worker was given,
+          // retrieved documents included — otherwise it flags every grounded
+          // claim as unsupported.
+          context: [retrieval.context, priorContext.join("\n")]
+            .filter(Boolean)
+            .join("\n\n"),
           output: output?.result,
-          // No retrieval layer exists yet, so the only context a worker ever
-          // has is the prior steps of its own run.
-          retrievalAvailable: false,
+          retrievalAvailable: retrieval.chunks.length > 0,
         });
         totalCost += critic.costUsd;
 
@@ -604,6 +627,10 @@ async function executePending(
           critic_risk: critic?.riskScore ?? null,
           cost_usd: cost,
           interaction_id: interactionId,
+          // Which documents grounded this step. Part of the ledger because
+          // "what was this answer based on?" is the first question asked of a
+          // decision that later turns out to be wrong.
+          retrieved_sources: retrieval.sources,
         },
       });
 
