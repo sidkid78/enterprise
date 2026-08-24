@@ -2,6 +2,8 @@ import "server-only";
 
 import { createClient } from "@/lib/supabase/server";
 
+import { getRunSpend } from "./finops";
+
 export type DagNodeStatus =
   | "completed"
   | "running"
@@ -41,6 +43,15 @@ export type GraphExecution = {
   status: string;
   rootPrompt: string;
   startedAt: string;
+  /**
+   * True cost of the run, from the token log.
+   *
+   * Summing the node rows misses the planning call and every critic gate, which
+   * are billed against the run but belong to no node. Null when the run has no
+   * logged calls.
+   */
+  trueCostUsd: number | null;
+  trueTokens: number | null;
   deliverable: RunDeliverable | null;
   nodes: DagNode[];
 };
@@ -138,6 +149,8 @@ export async function getRecentExecutions(
     throw new Error(`Failed to load executions: ${error.message}`);
   }
 
+  const spendByRun = await getRunSpend(workspaceId, limit);
+
   type NodeRow = {
     node_id: string;
     agent_role: string;
@@ -169,6 +182,8 @@ export async function getRecentExecutions(
     status: row.status,
     rootPrompt: row.root_prompt,
     startedAt: row.started_at,
+    trueCostUsd: spendByRun.get(row.id)?.totalCostUsd ?? null,
+    trueTokens: spendByRun.get(row.id)?.totalTokens ?? null,
     deliverable: toDeliverable(row.final_output),
     nodes: (row.agent_node_executions ?? [])
       .slice()

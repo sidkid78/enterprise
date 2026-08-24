@@ -141,6 +141,18 @@ Parent/child: chunks are embedded small so retrieval is precise, and what the wo
 - Tool loops multiply requests per run — plan, per-node turns, each tool hop, plus the critic. This hits the Gemini free tier's 20/min limit quickly.
 - The **Tool Access** dashboard tab (`McpToolRegistry`) registers servers, runs discovery, and flips the three per-tool switches. Every member can read the registry — seeing what agents can reach is the point — while only `workspace_owner` / `ai_administrator` may change it, enforced by RLS as well as by the Server Action.
 
+## FinOps
+
+`src/lib/data/finops.ts` plus three RPCs in migration `…13`.
+
+- **`record_spend` is atomic and returns the resulting budget state.** `bumpSpend()` was read-modify-write in TypeScript, so two runs billing concurrently lost one of the updates — demonstrated: charging $5 then $7 that way left the total at $7. Never reintroduce a read-then-write here; the charge and the "am I now over?" answer must come from the same statement or they are a second race.
+- **Budget is enforced before every node, not only at launch.** A graph inside its cap at launch can exhaust it midway, and completing anyway is how a hard stop becomes a suggestion. A halt sets `halted_finops`, writes a `budget_halt` ledger row, and **preserves completed nodes** — raising the cap and resuming continues from the halt point.
+- Spend settles **per node** rather than once at the end, so an in-flight run is visible to a concurrent budget check and a crash mid-graph still bills the work done.
+- `max_tokens_per_execution` is now enforced too (`token_ceiling_halt`); it had existed unused since migration `…04`. It catches the single pathological run that the monthly cap cannot.
+- A cap of `0` means **unset**, not "no budget" — the `over_budget` predicate lives in SQL so the launch gate and the per-node gate cannot drift apart.
+- **`agent_node_executions.cost_usd` is not the cost of a run.** The planning call and every critic gate are billed to the run but belong to no node, so summing node rows under-reports — measured at 18% on one run. `run_spend_summary` sums `finops_token_logs` instead, and the DAG tab shows that figure with an "(incl. orchestration)" note.
+- Operator-facing dollar amounts go through `formatUsd()`: `toFixed(2)` renders this platform's sub-cent runs as "$0.00 of $0.00", which reads as a bug rather than a budget stop.
+
 ## Governance visibility
 
 The **Governance & Audit** tab reads `guardrail_events` and `agent_audit_ledger`, which the runtime had been writing since Phase 5 with nothing reading them.

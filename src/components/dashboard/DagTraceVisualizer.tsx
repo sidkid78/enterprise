@@ -76,7 +76,10 @@ export default function DagTraceVisualizer({
     (sum, n) => sum + n.latencyMs,
     0,
   );
-  const totalCost = execution.nodes.reduce((sum, n) => sum + n.costUsd, 0);
+  // Node rows exclude the planning call and the critic gates, so the logged
+  // figure is the one to show when we have it.
+  const nodeCost = execution.nodes.reduce((sum, n) => sum + n.costUsd, 0);
+  const totalCost = execution.trueCostUsd ?? nodeCost;
 
   return (
     <div className="rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
@@ -117,6 +120,14 @@ export default function DagTraceVisualizer({
             <span className="font-bold text-cyan-400">
               ${totalCost.toFixed(6)}
             </span>
+            {execution.trueCostUsd !== null && totalCost > nodeCost && (
+              <span
+                className="ml-1 text-[10px] text-slate-500"
+                title="Includes the planning call and critic gates, which belong to no single node."
+              >
+                (incl. orchestration)
+              </span>
+            )}
           </div>
         </div>
       </div>

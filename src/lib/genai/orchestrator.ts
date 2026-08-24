@@ -205,6 +205,20 @@ function toolEvidence(calls: ToolCallRecord[]): string {
   ].join("\n");
 }
 
+/**
+ * Formats a dollar amount for an operator-facing message.
+ *
+ * Two decimals is right for real budgets and useless for the amounts this
+ * platform actually produces — a run costing $0.0018 against a $0.0015 cap
+ * renders as "$0.00 of $0.00", which reads as a bug rather than a budget stop.
+ * Small values keep enough precision to be meaningful.
+ */
+function formatUsd(value: number): string {
+  if (value === 0) return "$0.00";
+  if (Math.abs(value) < 0.01) return `$${value.toFixed(6)}`;
+  return `$${value.toFixed(2)}`;
+}
+
 async function recordLedger(
   db: Db,
   entry: {
@@ -263,17 +277,77 @@ async function recordGuardrail(
  * while runs are launched by hand; make this an atomic SQL increment before it
  * drives real billing.
  */
-async function bumpSpend(db: Db, workspaceId: string, delta: number) {
-  if (delta <= 0) return;
-  const { data } = await db
-    .from("finops_budget_controls")
-    .select("current_spend_usd")
-    .eq("workspace_id", workspaceId)
-    .maybeSingle();
-  await db
-    .from("finops_budget_controls")
-    .update({ current_spend_usd: Number(data?.current_spend_usd ?? 0) + delta })
-    .eq("workspace_id", workspaceId);
+export type BudgetState = {
+  currentSpendUsd: number;
+  monthlyBudgetUsd: number;
+  hardStopEnabled: boolean;
+  overBudget: boolean;
+  /** 0 means unset, not "no tokens allowed". */
+  maxTokensPerExecution: number;
+  maxAgentLoopRecursion: number;
+};
+
+/**
+ * Charges spend to the workspace and reports the budget state that results.
+ *
+ * Atomic: the increment happens inside one UPDATE, so concurrent runs serialize
+ * on the row rather than racing. The previous read-modify-write in TypeScript
+ * lost an update whenever two runs billed at once — silently under-billing by
+ * whatever the losing run cost.
+ *
+ * Returns null only when the workspace has no budget row, which the callers
+ * treat as "uncapped" rather than "blocked".
+ */
+async function recordSpend(
+  db: Db,
+  workspaceId: string,
+  delta: number,
+): Promise<BudgetState | null> {
+  if (delta <= 0) return await readBudget(db, workspaceId);
+
+  const { data, error } = await db.rpc("record_spend", {
+    p_workspace_id: workspaceId,
+    p_delta: delta,
+  });
+
+  if (error) return null;
+
+  const row = (data as Record<string, unknown>[] | null)?.[0];
+  if (!row) return null;
+
+  return {
+    currentSpendUsd: Number(row.current_spend_usd ?? 0),
+    monthlyBudgetUsd: Number(row.monthly_budget_usd ?? 0),
+    hardStopEnabled: row.hard_stop_enabled !== false,
+    overBudget: row.over_budget === true,
+    // record_spend does not return the caps; a caller needing them reads.
+    maxTokensPerExecution: 0,
+    maxAgentLoopRecursion: 0,
+  };
+}
+
+/** Budget state without charging anything. */
+async function readBudget(
+  db: Db,
+  workspaceId: string,
+): Promise<BudgetState | null> {
+  const { data, error } = await db.rpc("get_budget_state", {
+    p_workspace_id: workspaceId,
+  });
+
+  if (error) return null;
+
+  const row = (data as Record<string, unknown>[] | null)?.[0];
+  if (!row) return null;
+
+  return {
+    currentSpendUsd: Number(row.current_spend_usd ?? 0),
+    monthlyBudgetUsd: Number(row.monthly_budget_usd ?? 0),
+    hardStopEnabled: row.hard_stop_enabled !== false,
+    overBudget: row.over_budget === true,
+    maxTokensPerExecution: Number(row.max_tokens_per_execution ?? 0),
+    maxAgentLoopRecursion: Number(row.max_agent_loop_recursion ?? 0),
+  };
 }
 
 async function markFailed(db: Db, graphId: string, message: string): Promise<RunResult> {
@@ -349,6 +423,94 @@ async function executePending(
   let totalCost = 0;
   const reportedCost = () => totalCost + priorCost;
 
+  /**
+   * Cost already charged to the workspace. Spend is settled per node rather
+   * than once at the end, so an in-flight run's cost is visible to a concurrent
+   * budget check and a run that dies mid-graph has still been billed for the
+   * work it actually did.
+   */
+  let chargedCost = 0;
+
+  /**
+   * Tokens consumed by this run so far, against
+   * finops_budget_controls.max_tokens_per_execution — a column that has existed
+   * since migration ...04 and was never enforced. It is the guard against one
+   * pathological run, which the monthly cap does not catch: a single graph can
+   * burn an enormous number of tokens while still leaving the month in budget.
+   */
+  let totalTokens = 0;
+
+  /** Settles everything spent since the last settlement. */
+  const settle = async (): Promise<BudgetState | null> => {
+    const outstanding = totalCost - chargedCost;
+    if (outstanding <= 0) return await readBudget(db, workspaceId);
+    chargedCost = totalCost;
+    return await recordSpend(db, workspaceId, outstanding);
+  };
+
+  /** Ends the run because it exceeded its per-execution token ceiling. */
+  const haltForTokens = async (atNode: string): Promise<RunResult> => {
+    await settle();
+
+    await db
+      .from("agent_graph_executions")
+      .update({
+        status: "halted_finops",
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", graphId);
+
+    await recordLedger(db, {
+      workspaceId,
+      graphExecutionId: graphId,
+      agentId: "FinOpsGovernor",
+      actionType: "token_ceiling_halt",
+      payload: {
+        halted_before: atNode,
+        tokens_used: totalTokens,
+        ceiling: tokenCeiling,
+      },
+    });
+
+    return {
+      graphExecutionId: graphId,
+      status: "halted_finops",
+      message: `Halted before ${atNode}: this run used ${totalTokens.toLocaleString()} tokens, at or above its ${tokenCeiling.toLocaleString()} ceiling.`,
+    };
+  };
+
+  /** Ends the run because the workspace is out of budget. */
+  const haltForBudget = async (
+    budget: BudgetState,
+    atNode: string,
+  ): Promise<RunResult> => {
+    await db
+      .from("agent_graph_executions")
+      .update({
+        status: "halted_finops",
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", graphId);
+
+    await recordLedger(db, {
+      workspaceId,
+      graphExecutionId: graphId,
+      agentId: "FinOpsGovernor",
+      actionType: "budget_halt",
+      payload: {
+        halted_before: atNode,
+        spend_usd: budget.currentSpendUsd,
+        budget_usd: budget.monthlyBudgetUsd,
+      },
+    });
+
+    return {
+      graphExecutionId: graphId,
+      status: "halted_finops",
+      message: `Halted before ${atNode}: budget exhausted at ${formatUsd(budget.currentSpendUsd)} of ${formatUsd(budget.monthlyBudgetUsd)}. Completed steps are preserved and the run can resume once the budget is raised.`,
+    };
+  };
+
   const { data: rows, error } = await db
     .from("agent_node_executions")
     .select(
@@ -361,6 +523,9 @@ async function executePending(
 
   const nodes = (rows ?? []) as NodeRow[];
   const completed = nodes.filter((n) => n.node_status === "completed");
+
+  // Per-execution token ceiling, read once. Zero means unset.
+  const tokenCeiling = (await readBudget(db, workspaceId))?.maxTokensPerExecution ?? 0;
 
   // Loaded once for the whole graph rather than per node: the registry is
   // small, and a tool appearing or vanishing midway through a run would make
@@ -382,6 +547,21 @@ async function executePending(
   try {
     for (const node of nodes) {
       if (node.node_status !== "pending") continue;
+
+      // Budget is checked before every node, not only before the run. A graph
+      // that was inside its cap at launch can exhaust it halfway through —
+      // especially now that a single node may make several tool round trips —
+      // and completing anyway is how a "hard stop" quietly becomes a
+      // suggestion. Steps already finished stay committed; the run resumes
+      // from here once the cap is raised.
+      const preNodeBudget = await settle();
+      if (preNodeBudget?.overBudget) {
+        return await haltForBudget(preNodeBudget, node.node_id);
+      }
+
+      if (tokenCeiling > 0 && totalTokens >= tokenCeiling) {
+        return await haltForTokens(node.node_id);
+      }
 
       const model = node.model_routing_used;
       const tier = (Object.keys(MODEL_TIERS) as ModelTier[]).find(
@@ -449,7 +629,7 @@ async function executePending(
           .update({ status: "waiting_hitl" })
           .eq("id", graphId);
 
-        await bumpSpend(db, workspaceId, totalCost);
+        await settle();
         return {
           graphExecutionId: graphId,
           status: "waiting_hitl",
@@ -631,6 +811,9 @@ async function executePending(
         usage = turn.usage;
         cost = estimateCostUsd(model, usage.inputTokens, usage.outputTokens);
         totalCost += cost;
+        // Counted against the per-execution ceiling. A cached node adds
+        // nothing here, which is correct: it consumed no tokens.
+        totalTokens += usage.inputTokens + usage.outputTokens;
         toolCalls = turn.toolCalls;
 
         // A human-approved tool call runs before this turn starts, so the loop
@@ -771,6 +954,7 @@ async function executePending(
             retrieval.chunks.length > 0 || toolEvidence(toolCalls) !== "",
         });
         totalCost += critic.costUsd;
+        totalTokens += critic.inputTokens + critic.outputTokens;
 
         await db.from("finops_token_logs").insert({
           workspace_id: workspaceId,
@@ -883,6 +1067,10 @@ async function executePending(
       }
 
       priorContext.push(`- ${node.node_id}: ${output!.summary}`);
+
+      // Settle this node's cost now rather than at the end of the graph, so a
+      // concurrent run sees it and a crash after this point still bills it.
+      await settle();
     }
 
     // The deliverable. Previously `final_output` held only the step summaries,
@@ -900,14 +1088,14 @@ async function executePending(
       })
       .eq("id", graphId);
 
-    await bumpSpend(db, workspaceId, totalCost);
+    await settle();
     return {
       graphExecutionId: graphId,
       status: "completed",
-      message: `Completed. Spend this run: $${reportedCost().toFixed(6)}.`,
+      message: `Completed. Spend this run: ${formatUsd(reportedCost())}.`,
     };
   } catch (err) {
-    await bumpSpend(db, workspaceId, totalCost);
+    await settle();
     return await markFailed(
       db,
       graphId,
@@ -941,16 +1129,14 @@ export async function launchGraph(params: {
   const client = getGenAI();
 
   // --- FinOps gate: refuse to start an over-budget workspace ------------
-  const { data: budget } = await db
-    .from("finops_budget_controls")
-    .select("monthly_budget_usd, current_spend_usd, hard_stop_enabled, max_agent_loop_recursion")
-    .eq("workspace_id", workspaceId)
-    .maybeSingle();
+  // The same over_budget predicate the database uses mid-run, so the two
+  // cannot drift apart into "the launch gate says yes and the node gate says
+  // no".
+  const budget = await readBudget(db, workspaceId);
+  const spend = budget?.currentSpendUsd ?? 0;
+  const cap = budget?.monthlyBudgetUsd ?? 0;
 
-  const spend = Number(budget?.current_spend_usd ?? 0);
-  const cap = Number(budget?.monthly_budget_usd ?? 0);
-
-  if ((budget?.hard_stop_enabled ?? true) && cap > 0 && spend >= cap) {
+  if (budget?.overBudget) {
     const { data: halted } = await db
       .from("agent_graph_executions")
       .insert({
@@ -967,13 +1153,13 @@ export async function launchGraph(params: {
     return {
       graphExecutionId: halted?.id ?? "",
       status: "halted_finops",
-      message: `Budget exhausted: $${spend.toFixed(2)} of $${cap.toFixed(2)} used.`,
+      message: `Budget exhausted: ${formatUsd(spend)} of ${formatUsd(cap)} used.`,
     };
   }
 
   const nodeBudget = Math.min(
     MAX_NODES,
-    Number(budget?.max_agent_loop_recursion ?? MAX_NODES),
+    budget?.maxAgentLoopRecursion || MAX_NODES,
   );
 
   const { data: graph, error: graphError } = await db
@@ -1079,7 +1265,7 @@ export async function launchGraph(params: {
       estimated_cost_usd: planCost,
       routing_tier: ROUTING_TIER_LABEL.cheap,
     });
-    await bumpSpend(db, workspaceId, planCost);
+    await recordSpend(db, workspaceId, planCost);
 
     // Storing the planning interaction id is what lets the first worker inherit
     // the plan's context, and what a resume falls back to.

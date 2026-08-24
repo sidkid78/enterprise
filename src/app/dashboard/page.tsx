@@ -24,6 +24,7 @@ import {
   verifyLedgerChain,
   LEDGER_ROLES,
 } from "@/lib/data/governance";
+import { getBudgetStatus } from "@/lib/data/finops";
 import { getMcpServers, getMcpTools } from "@/lib/data/mcp";
 import { getTrainingModules } from "@/lib/data/workforce";
 import { resolveActiveWorkspace } from "@/lib/data/workspaces";
@@ -58,10 +59,11 @@ export default async function EnterpriseDashboardPage({
   const { active, all } = await resolveActiveWorkspace(requestedWorkspace);
 
   // Header counters are always shown, so they load regardless of active tab.
-  const [pendingHitlCount, activeDagRuns, roi] = await Promise.all([
+  const [pendingHitlCount, activeDagRuns, roi, budget] = await Promise.all([
     countPendingGates(active.id),
     countActiveExecutions(active.id),
     getRoiSummary(active.id),
+    getBudgetStatus(active.id),
   ]);
 
   const tabHref = (key: TabKey) =>
@@ -98,6 +100,43 @@ export default async function EnterpriseDashboardPage({
                 {roi.uptimeSlaActual.toFixed(2)}%
               </span>
             </div>
+            {budget && budget.monthlyBudgetUsd > 0 && (
+              <>
+                <div className="h-4 w-px bg-slate-800"></div>
+                {/*
+                  Spend against the cap, in the header rather than on a tab,
+                  because a workspace that has run out of budget stops
+                  everything — that is not a fact to go looking for.
+                */}
+                <div
+                  className="text-xs"
+                  title={
+                    budget.hardStopEnabled
+                      ? "Runs are refused once spend reaches the cap."
+                      : "Hard stop is disabled; runs continue past the cap."
+                  }
+                >
+                  <span className="text-slate-400">Budget: </span>
+                  <span
+                    className={`font-mono font-bold ${
+                      budget.overBudget
+                        ? "text-rose-400"
+                        : (budget.fractionUsed ?? 0) >= 0.8
+                          ? "text-amber-400"
+                          : "text-emerald-400"
+                    }`}
+                  >
+                    ${budget.currentSpendUsd.toFixed(2)} / $
+                    {budget.monthlyBudgetUsd.toFixed(2)}
+                  </span>
+                  {budget.overBudget && (
+                    <span className="ml-1.5 rounded border border-rose-500/40 bg-rose-500/10 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-rose-400">
+                      {budget.hardStopEnabled ? "Halted" : "Over"}
+                    </span>
+                  )}
+                </div>
+              </>
+            )}
             <div className="h-4 w-px bg-slate-800"></div>
             <div className="text-xs">
               <span className="text-slate-400">Deflected Cost: </span>
