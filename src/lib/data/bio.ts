@@ -133,3 +133,156 @@ export async function getRoiSummary(workspaceId: string): Promise<RoiSummary> {
     dailyDeflectedCost,
   };
 }
+
+export type Baseline = {
+  id: string;
+  metricKey: string;
+  description: string | null;
+  minutesPerOccurrence: number;
+  hourlyRateUsd: number;
+  /** What one occurrence is worth, precomputed for the UI. */
+  valuePerOccurrenceUsd: number;
+};
+
+export type Outcome = {
+  id: string;
+  graphExecutionId: string;
+  metricKey: string;
+  occurrences: number;
+  timeSavedMinutes: number;
+  deflectedCostUsd: number;
+  createdAt: string;
+};
+
+export type AttributableRun = {
+  id: string;
+  rootPrompt: string;
+  startedAt: string;
+  /** Metric keys this run has already been attributed to. */
+  attributedTo: string[];
+};
+
+export async function getBaselines(workspaceId: string): Promise<Baseline[]> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase
+    .from("bio_baseline_metrics")
+    .select("id, metric_key, description, baseline_value, hourly_rate_usd")
+    .eq("workspace_id", workspaceId)
+    .order("metric_key", { ascending: true });
+
+  if (error) throw new Error(`Failed to load baselines: ${error.message}`);
+
+  type Row = {
+    id: string;
+    metric_key: string;
+    description: string | null;
+    baseline_value: number | string | null;
+    hourly_rate_usd: number | string | null;
+  };
+
+  return ((data ?? []) as Row[]).map((row) => {
+    const minutes = Number(row.baseline_value ?? 0);
+    const rate = Number(row.hourly_rate_usd ?? 0);
+    return {
+      id: row.id,
+      metricKey: row.metric_key,
+      description: row.description,
+      minutesPerOccurrence: minutes,
+      hourlyRateUsd: rate,
+      valuePerOccurrenceUsd: (minutes / 60) * rate,
+    };
+  });
+}
+
+export async function getOutcomes(
+  workspaceId: string,
+  limit = 50,
+): Promise<Outcome[]> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase
+    .from("bio_outcome_logs")
+    .select(
+      "id, graph_execution_id, metric_key, measured_value, time_saved_minutes, deflected_cost_usd, created_at",
+    )
+    .eq("workspace_id", workspaceId)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw new Error(`Failed to load outcomes: ${error.message}`);
+
+  type Row = {
+    id: string;
+    graph_execution_id: string;
+    metric_key: string;
+    measured_value: number | string | null;
+    time_saved_minutes: number | string | null;
+    deflected_cost_usd: number | string | null;
+    created_at: string;
+  };
+
+  return ((data ?? []) as Row[]).map((row) => ({
+    id: row.id,
+    graphExecutionId: row.graph_execution_id,
+    metricKey: row.metric_key,
+    occurrences: Number(row.measured_value ?? 0),
+    timeSavedMinutes: Number(row.time_saved_minutes ?? 0),
+    deflectedCostUsd: Number(row.deflected_cost_usd ?? 0),
+    createdAt: row.created_at,
+  }));
+}
+
+/**
+ * Completed runs, with what each has already been attributed to.
+ *
+ * Only completed runs: a halted or failed run delivered nothing, so letting one
+ * be attributed would put imaginary savings on the ROI tab.
+ */
+export async function getAttributableRuns(
+  workspaceId: string,
+  limit = 25,
+): Promise<AttributableRun[]> {
+  const supabase = await createClient();
+
+  const [runs, outcomes] = await Promise.all([
+    supabase
+      .from("agent_graph_executions")
+      .select("id, root_prompt, started_at")
+      .eq("workspace_id", workspaceId)
+      .eq("status", "completed")
+      .order("started_at", { ascending: false })
+      .limit(limit),
+    supabase
+      .from("bio_outcome_logs")
+      .select("graph_execution_id, metric_key")
+      .eq("workspace_id", workspaceId),
+  ]);
+
+  if (runs.error) {
+    throw new Error(`Failed to load runs: ${runs.error.message}`);
+  }
+
+  const claimed = new Map<string, string[]>();
+  for (const row of (outcomes.data ?? []) as {
+    graph_execution_id: string;
+    metric_key: string;
+  }[]) {
+    const list = claimed.get(row.graph_execution_id) ?? [];
+    list.push(row.metric_key);
+    claimed.set(row.graph_execution_id, list);
+  }
+
+  return (
+    (runs.data ?? []) as {
+      id: string;
+      root_prompt: string;
+      started_at: string;
+    }[]
+  ).map((row) => ({
+    id: row.id,
+    rootPrompt: row.root_prompt,
+    startedAt: row.started_at,
+    attributedTo: claimed.get(row.id) ?? [],
+  }));
+}

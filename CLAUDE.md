@@ -141,6 +141,18 @@ Parent/child: chunks are embedded small so retrieval is precise, and what the wo
 - Tool loops multiply requests per run — plan, per-node turns, each tool hop, plus the critic. This hits the Gemini free tier's 20/min limit quickly.
 - The **Tool Access** dashboard tab (`McpToolRegistry`) registers servers, runs discovery, and flips the three per-tool switches. Every member can read the registry — seeing what agents can reach is the point — while only `workspace_owner` / `ai_administrator` may change it, enforced by RLS as well as by the Server Action.
 
+## Workforce and BIO (Pillars 6-7)
+
+`src/lib/workforce/sop.ts`, `src/app/dashboard/outcome-actions.ts`. Both tables were readable from the start and had no writer, which is why the ROI tab showed $0.00 for so long.
+
+- **The runtime never estimates its own savings.** ROI enters only when a person records a baseline (minutes by hand, and the loaded hourly rate of whoever did it) and a person attributes a *completed* run to it. Having the platform score itself would be fabricated revenue — the same claim the critic gate refuses everywhere else. A halted or failed run cannot be attributed, since it delivered nothing.
+- The rate lives on the baseline, not the workspace: a partner reviewing contracts and a coordinator re-keying invoices do not save the business the same amount per hour recovered.
+- A unique index on `(graph_execution_id, metric_key)` stops double attribution. An ROI figure that grows on a double click is worse than no figure.
+- **SOPs are generated deterministically from a completed run** — no model call, same reasoning as `buildRunReport`. A synthesis pass could describe a procedure that differs from the one that actually ran, which is the one thing an SOP must not do. Steps come out in `depends_on` order, each carrying its node's **objective** (what to do) separately from its **outcome** (what happened last time), and steps that hit a HITL gate are marked `requiredHuman`.
+- Summaries the runtime writes for bookkeeping ("Approved by human reviewer.") are filtered out of `outcome` — true, and useless as an instruction.
+- A new SOP is always `is_published: false`. Observing how something was done once is not endorsing it as how the team should work; publishing is a separate human act. Re-generating supersedes with a bumped `version`.
+- `ai_docs/edgecraft-revops.md` describes the business this models — assessment, baseline, blueprint, measured recovery. The BIO tables map onto it directly.
+
 ## FinOps
 
 `src/lib/data/finops.ts` plus three RPCs in migration `…13`.

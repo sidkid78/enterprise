@@ -4,13 +4,20 @@ import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercializat
 import GovernanceControlPlane from "@/components/dashboard/GovernanceControlPlane";
 import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
 import McpToolRegistry from "@/components/dashboard/McpToolRegistry";
+import OutcomeAttribution from "@/components/dashboard/OutcomeAttribution";
+import SopWorkbench from "@/components/dashboard/SopWorkbench";
 import DagTraceVisualizer from "@/components/dashboard/DagTraceVisualizer";
 import HitlQueueDashboard from "@/components/dashboard/HitlQueueDashboard";
 import LaunchRunForm from "@/components/dashboard/LaunchRunForm";
 import WorkforceUpskillingHub from "@/components/dashboard/WorkforceUpskillingHub";
 import WorkspaceSwitcher from "@/components/dashboard/WorkspaceSwitcher";
 import { signOut } from "@/app/login/actions";
-import { getRoiSummary } from "@/lib/data/bio";
+import {
+  getAttributableRuns,
+  getBaselines,
+  getOutcomes,
+  getRoiSummary,
+} from "@/lib/data/bio";
 import { countActiveExecutions, getRecentExecutions } from "@/lib/data/dag";
 import { countPendingGates, getPendingGates } from "@/lib/data/hitl";
 import {
@@ -226,16 +233,13 @@ export default async function EnterpriseDashboardPage({
           <GovernanceTab workspaceId={active.id} viewerRole={active.role} />
         )}
         {tab === "upskilling" && (
-          <WorkforceUpskillingHub
-            workspaceName={active.name}
-            modules={await getTrainingModules(active.id)}
-          />
+          <UpskillingTab workspaceId={active.id} workspaceName={active.name} viewerRole={active.role} />
         )}
         {tab === "bio" && (
-          <BioRoiCommercialization
-            workspaceName={active.name}
-            roi={roi}
-          />
+          <div className="space-y-6">
+            <BioRoiCommercialization workspaceName={active.name} roi={roi} />
+            <BioAttributionTab workspaceId={active.id} viewerRole={active.role} />
+          </div>
         )}
       </main>
     </div>
@@ -271,6 +275,60 @@ async function GovernanceTab({
       ledger={ledger}
       verification={verification}
       canReadLedger={canReadLedger}
+    />
+  );
+}
+
+/** Roles that may draft procedures and record commercial measurements. */
+const REPORTING_ROLES = ["workspace_owner", "ai_administrator"];
+
+async function UpskillingTab({
+  workspaceId,
+  workspaceName,
+  viewerRole,
+}: {
+  workspaceId: string;
+  workspaceName: string;
+  viewerRole: string;
+}) {
+  const [modules, runs] = await Promise.all([
+    getTrainingModules(workspaceId),
+    getAttributableRuns(workspaceId),
+  ]);
+
+  return (
+    <>
+      <SopWorkbench
+        workspaceId={workspaceId}
+        runs={runs}
+        sops={modules}
+        canEdit={REPORTING_ROLES.includes(viewerRole)}
+      />
+      <WorkforceUpskillingHub workspaceName={workspaceName} modules={modules} />
+    </>
+  );
+}
+
+async function BioAttributionTab({
+  workspaceId,
+  viewerRole,
+}: {
+  workspaceId: string;
+  viewerRole: string;
+}) {
+  const [baselines, outcomes, runs] = await Promise.all([
+    getBaselines(workspaceId),
+    getOutcomes(workspaceId),
+    getAttributableRuns(workspaceId),
+  ]);
+
+  return (
+    <OutcomeAttribution
+      workspaceId={workspaceId}
+      baselines={baselines}
+      outcomes={outcomes}
+      runs={runs}
+      canEdit={REPORTING_ROLES.includes(viewerRole)}
     />
   );
 }
