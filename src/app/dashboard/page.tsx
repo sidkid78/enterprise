@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercialization";
 import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
+import McpToolRegistry from "@/components/dashboard/McpToolRegistry";
 import DagTraceVisualizer from "@/components/dashboard/DagTraceVisualizer";
 import HitlQueueDashboard from "@/components/dashboard/HitlQueueDashboard";
 import LaunchRunForm from "@/components/dashboard/LaunchRunForm";
@@ -15,6 +16,7 @@ import {
   getKnowledgeBases,
   getKnowledgeDocuments,
 } from "@/lib/data/knowledge";
+import { getMcpServers, getMcpTools } from "@/lib/data/mcp";
 import { getTrainingModules } from "@/lib/data/workforce";
 import { resolveActiveWorkspace } from "@/lib/data/workspaces";
 
@@ -22,6 +24,7 @@ const TABS = [
   { key: "hitl", label: "HITL Decision Queue" },
   { key: "dag", label: "DAG Execution Visualizer" },
   { key: "knowledge", label: "Domain Knowledge" },
+  { key: "tools", label: "Tool Access" },
   { key: "upskilling", label: "Workforce Enablement & SOPs" },
   { key: "bio", label: "BIO ROI & SLA Billing" },
 ] as const;
@@ -162,6 +165,13 @@ export default async function EnterpriseDashboardPage({
             workspaceId={active.id}
             bases={await getKnowledgeBases(active.id)}
             documents={await getKnowledgeDocuments(active.id)}
+          />
+        )}
+        {tab === "tools" && (
+          <McpToolRegistry
+            workspaceId={active.id}
+            servers={await getMcpServers(active.id)}
+            tools={await getMcpTools(active.id)}
           />
         )}
         {tab === "upskilling" && (

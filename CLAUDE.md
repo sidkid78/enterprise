@@ -139,6 +139,7 @@ Parent/child: chunks are embedded small so retrieval is precise, and what the wo
 - Ledger action types: real MCP calls are `tool_invocation`; node summaries are `node_completion` (they used to share `tool_invocation`, which made them indistinguishable).
 - `mcp_servers.encrypted_auth_metadata` is **not** actually encrypted; it is kept out of client reach by column-level grants (migration ...11), since RLS filters rows and cannot mask a column. Encrypt it before storing a production credential.
 - Tool loops multiply requests per run — plan, per-node turns, each tool hop, plus the critic. This hits the Gemini free tier's 20/min limit quickly.
+- The **Tool Access** dashboard tab (`McpToolRegistry`) registers servers, runs discovery, and flips the three per-tool switches. Every member can read the registry — seeing what agents can reach is the point — while only `workspace_owner` / `ai_administrator` may change it, enforced by RLS as well as by the Server Action.
 
 ## Governance gates
 
