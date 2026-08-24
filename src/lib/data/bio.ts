@@ -11,6 +11,22 @@ export type RoiSummary = {
   roiPercentage: number | null;
   uptimeSlaTarget: number;
   uptimeSlaActual: number;
+  /**
+   * Measured downtime behind `uptimeSlaActual`, and how many incidents were
+   * recorded — which is a different question. Only a queue stall consumes
+   * availability; a failed run is an incident that leaves uptime alone, because
+   * the platform was up and gave a bad answer rather than being unreachable.
+   */
+  downtimeSeconds: number;
+  incidentCount: number;
+  openIncidentCount: number;
+  worstSeverity: string | null;
+  /**
+   * False when no availability window could be computed. The uptime figure then
+   * has no measurement behind it and must not be rendered as a passing SLA —
+   * "nothing was recorded" and "nothing went wrong" are different claims.
+   */
+  availabilityMeasured: boolean;
   activeAgents: number;
   dailyDeflectedCost: { date: string; value: number }[];
 };
@@ -34,7 +50,7 @@ export async function getRoiSummary(workspaceId: string): Promise<RoiSummary> {
   const supabase = await createClient();
   const since = new Date(Date.now() - 7 * DAY_MS).toISOString();
 
-  const [outcomes, tokens, subscription, breaches, agents] = await Promise.all([
+  const [outcomes, tokens, subscription, availability, agents] = await Promise.all([
     supabase
       .from("bio_outcome_logs")
       .select("deflected_cost_usd, time_saved_minutes, created_at")
@@ -50,11 +66,14 @@ export async function getRoiSummary(workspaceId: string): Promise<RoiSummary> {
       .select("sla_uptime_target")
       .eq("workspace_id", workspaceId)
       .maybeSingle(),
-    supabase
-      .from("sla_breach_events")
-      .select("id", { count: "exact", head: true })
-      .eq("workspace_id", workspaceId)
-      .gte("created_at", since),
+    // Availability is computed in SQL rather than counted here: the definition
+    // of downtime (which breach types consume it, how overlapping outages
+    // merge, how an interval straddling the window edge is clipped) has to live
+    // in one place, the same reason `over_budget` is a SQL predicate.
+    supabase.rpc("workspace_availability", {
+      p_workspace_id: workspaceId,
+      p_window_hours: 168,
+    }),
     supabase
       .from("agent_node_executions")
       .select("agent_role")
@@ -63,7 +82,7 @@ export async function getRoiSummary(workspaceId: string): Promise<RoiSummary> {
   ]);
 
   const firstError =
-    outcomes.error ?? tokens.error ?? breaches.error ?? agents.error;
+    outcomes.error ?? tokens.error ?? availability.error ?? agents.error;
   if (firstError) {
     throw new Error(`Failed to load ROI summary: ${firstError.message}`);
   }
@@ -108,13 +127,22 @@ export async function getRoiSummary(workspaceId: string): Promise<RoiSummary> {
       ?.sla_uptime_target ?? 99.9,
   );
 
-  // Crude but honest: each breach event costs an hour of the 7-day window.
-  // Replace with real incident durations once sla_breach_events records them.
-  const breachHours = breaches.count ?? 0;
-  const uptimeSlaActual = Math.max(
-    0,
-    100 - (breachHours / (7 * 24)) * 100,
-  );
+  type AvailabilityRow = {
+    downtime_seconds: number | string | null;
+    uptime_pct: number | string | null;
+    incident_count: number | string | null;
+    open_incident_count: number | string | null;
+    worst_severity: string | null;
+  };
+
+  const availabilityRow = (availability.data as AvailabilityRow[] | null)?.[0] ?? null;
+
+  // No row means the window could not be measured. Reporting 100% here is what
+  // the old placeholder did, and it is the one answer that must not be given:
+  // an unmeasured SLA rendered as a perfect one is a fabricated compliance
+  // claim, which is precisely what the ledger and the critic exist to prevent.
+  const availabilityMeasured = availabilityRow !== null;
+  const uptimeSlaActual = Number(availabilityRow?.uptime_pct ?? 0);
 
   const netRoiUsd = totalDeflectedCostUsd - apiComputeCostUsd;
 
@@ -129,6 +157,11 @@ export async function getRoiSummary(workspaceId: string): Promise<RoiSummary> {
       apiComputeCostUsd > 0 ? (netRoiUsd / apiComputeCostUsd) * 100 : null,
     uptimeSlaTarget,
     uptimeSlaActual,
+    downtimeSeconds: Number(availabilityRow?.downtime_seconds ?? 0),
+    incidentCount: Number(availabilityRow?.incident_count ?? 0),
+    openIncidentCount: Number(availabilityRow?.open_incident_count ?? 0),
+    worstSeverity: availabilityRow?.worst_severity ?? null,
+    availabilityMeasured,
     activeAgents,
     dailyDeflectedCost,
   };

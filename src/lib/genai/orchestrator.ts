@@ -58,6 +58,16 @@ export type RunStatus =
   | "completed"
   | "waiting_hitl"
   | "failed"
+  /**
+   * A human rejected the gate, so the run stopped where it was supposed to.
+   *
+   * Distinct from `failed` because the queue retries a failure, and retrying
+   * this one just re-reads the same rejection until the attempts run out and
+   * the run dead-letters — presenting a reviewer's deliberate "no" to the
+   * operator as a platform breakdown. Exactly the reasoning that makes
+   * `waiting_hitl` a job success rather than a failure.
+   */
+  | "rejected"
   | "halted_finops";
 
 export type RunResult = {
@@ -1708,7 +1718,7 @@ export async function resumeGraph(graphExecutionId: string): Promise<RunResult> 
 
     return {
       graphExecutionId,
-      status: "failed",
+      status: "rejected",
       message: "Run terminated by human rejection.",
     };
   }

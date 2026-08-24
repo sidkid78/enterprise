@@ -89,18 +89,57 @@ export default function BioRoiCommercialization({
           <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-slate-400">
             SLA Uptime Tracker
           </p>
-          <p
-            className={`font-mono text-2xl font-bold ${
-              roi.uptimeSlaActual >= roi.uptimeSlaTarget
-                ? "text-white"
-                : "text-amber-400"
-            }`}
-          >
-            {roi.uptimeSlaActual.toFixed(3)}%
-          </p>
-          <p className="mt-2 text-xs text-slate-400">
-            Target: {roi.uptimeSlaTarget.toFixed(2)}%
-          </p>
+          {/*
+            An unmeasured SLA must never render as a passing one. The figure
+            here used to be 100.000% unconditionally, because nothing wrote
+            sla_breach_events and the breach count was always zero — a perfect
+            compliance claim produced by never having looked.
+          */}
+          {roi.availabilityMeasured ? (
+            <>
+              <p
+                className={`font-mono text-2xl font-bold ${
+                  roi.uptimeSlaActual >= roi.uptimeSlaTarget
+                    ? "text-white"
+                    : "text-amber-400"
+                }`}
+              >
+                {roi.uptimeSlaActual.toFixed(3)}%
+              </p>
+              <p className="mt-2 text-xs text-slate-400">
+                Target: {roi.uptimeSlaTarget.toFixed(2)}% ·{" "}
+                {roi.downtimeSeconds > 0
+                  ? `${Math.round(roi.downtimeSeconds / 60)} min unavailable`
+                  : "no downtime recorded"}{" "}
+                over 7 days
+              </p>
+              {roi.incidentCount > 0 && (
+                /*
+                  Incidents are counted apart from uptime on purpose. A failed
+                  run is the platform working and returning a bad answer; only a
+                  queue nothing was consuming is time the service was actually
+                  unavailable.
+                */
+                <p className="mt-1 text-xs text-slate-500">
+                  {roi.incidentCount} incident
+                  {roi.incidentCount === 1 ? "" : "s"} recorded
+                  {roi.openIncidentCount > 0 && (
+                    <span className="text-amber-400">
+                      {" "}
+                      · {roi.openIncidentCount} still open
+                    </span>
+                  )}
+                </p>
+              )}
+            </>
+          ) : (
+            <>
+              <p className="font-mono text-2xl font-bold text-slate-500">—</p>
+              <p className="mt-2 text-xs text-slate-400">
+                Not measured. Target: {roi.uptimeSlaTarget.toFixed(2)}%
+              </p>
+            </>
+          )}
         </div>
       </div>
 

@@ -111,11 +111,34 @@ export default async function EnterpriseDashboardPage({
           </div>
 
           <div className="hidden items-center space-x-6 lg:flex">
+            {/*
+              Only shown when there is a measurement behind it. A green pulsing
+              dot beside an unmeasured 100.00% is an availability claim the
+              platform has not earned.
+            */}
             <div className="flex items-center space-x-2">
-              <div className="h-2 w-2 animate-pulse rounded-full bg-emerald-400"></div>
+              <div
+                className={`h-2 w-2 rounded-full ${
+                  !roi.availabilityMeasured
+                    ? "bg-slate-600"
+                    : roi.uptimeSlaActual >= roi.uptimeSlaTarget
+                      ? "animate-pulse bg-emerald-400"
+                      : "animate-pulse bg-amber-400"
+                }`}
+              ></div>
               <span className="text-xs text-slate-400">SLA Uptime:</span>
-              <span className="font-mono text-xs font-semibold text-emerald-400">
-                {roi.uptimeSlaActual.toFixed(2)}%
+              <span
+                className={`font-mono text-xs font-semibold ${
+                  !roi.availabilityMeasured
+                    ? "text-slate-500"
+                    : roi.uptimeSlaActual >= roi.uptimeSlaTarget
+                      ? "text-emerald-400"
+                      : "text-amber-400"
+                }`}
+              >
+                {roi.availabilityMeasured
+                  ? `${roi.uptimeSlaActual.toFixed(2)}%`
+                  : "not measured"}
               </span>
             </div>
             {budget && budget.monthlyBudgetUsd > 0 && (
