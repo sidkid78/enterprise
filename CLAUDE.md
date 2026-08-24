@@ -126,6 +126,20 @@ Parent/child: chunks are embedded small so retrieval is precise, and what the wo
 - Retrieval is keyed on each node's **objective**, not the root prompt: every step asks a different question, and retrieving once up front would defeat the plan.
 - `fts_tokens` casts the regconfig explicitly (`'pg_catalog.english'::regconfig`) — the one-argument `to_tsvector` is only STABLE and a generated column requires IMMUTABLE.
 
+## MCP tools
+
+`src/lib/mcp/` — `client.ts` (Streamable HTTP JSON-RPC), `registry.ts` (DB rows to function declarations, and invocation), plus `src/lib/genai/tool-loop.ts` (the model/tool round trip).
+
+**The Interactions API's native `mcp_server` tool type is unusable here** — it supports Streamable HTTP only, and does not support Gemini 3 models, which is the whole cascade. So the runtime proxies MCP itself: registry tools are declared as ordinary functions and `runWorkerTurn` brokers the calls. That is also the better arrangement, because native remote MCP has the model provider call the tool directly, putting every invocation outside the approval gate, the guardrail events and the ledger.
+
+- **`mcp_tools.requires_approval` defaults to `true`.** Discovery cannot grant an agent the right to act unattended; an operator opts a tool out deliberately. A pending call escalates to a HITL gate carrying the tool, the arguments, and the interaction id to chain from.
+- **Tool results are screened for injection and PII-masked.** A result is third-party text flowing straight into the model's context — the most direct injection route in the system, since nobody reads it first. A blocked result is replaced with a refusal notice, never passed through. Masking applies because the result leaves the process again on the next turn.
+- **Tool results are part of the critic's context**, along with the root prompt. Both were omitted at first, and each omission made the critic flag genuine facts as fabrications: values fetched from a system of record, and facts the requester themselves asserted. If you add a new source of grounding, add it to the critic's context in the same change.
+- **An approved call is staged, not replayed.** `applyApprovedToolCall` runs the tool, writes `input_payload.resume_tool_result`, and returns the node to `pending`; the node loop then sends a `function_result` chained from the requesting interaction. If the turn after the call fails, `hasStagedToolResult` resumes the continuation without re-invoking — issuing a credit twice because the second half failed is precisely what the gate exists to prevent.
+- Ledger action types: real MCP calls are `tool_invocation`; node summaries are `node_completion` (they used to share `tool_invocation`, which made them indistinguishable).
+- `mcp_servers.encrypted_auth_metadata` is **not** actually encrypted; it is kept out of client reach by column-level grants (migration ...11), since RLS filters rows and cannot mask a column. Encrypt it before storing a production credential.
+- Tool loops multiply requests per run — plan, per-node turns, each tool hop, plus the critic. This hits the Gemini free tier's 20/min limit quickly.
+
 ## Governance gates
 
 `src/lib/governance/` — `pii.ts`, `injection.ts`, `critic.ts`. Every gate writes a `guardrail_events` row.
