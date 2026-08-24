@@ -1097,6 +1097,38 @@ async function executePending(
       await settle();
     }
 
+    // Reaching the end of the loop is not the same as having run everything.
+    // The loop `continue`s past any node that is not `pending`, so a node left
+    // in a terminal-but-unfinished state — `failed` from a human rejection or
+    // an injection block — falls straight through to here and the graph is
+    // marked completed without it. That was unreachable while a failed run was
+    // never re-entered; the dead-letter requeue path makes it reachable, so it
+    // has to be closed in the same change rather than left as a latent one.
+    //
+    // Re-read rather than trusting `nodes`: those statuses were loaded before
+    // the loop ran and are stale by definition.
+    const { data: unfinishedRows } = await db
+      .from("agent_node_executions")
+      .select("node_id, node_status")
+      .eq("graph_execution_id", graphId)
+      .neq("node_status", "completed");
+
+    const unfinished = (unfinishedRows ?? []) as {
+      node_id: string;
+      node_status: string;
+    }[];
+
+    if (unfinished.length > 0) {
+      await settle();
+      return await markFailed(
+        db,
+        graphId,
+        `Cannot complete: ${unfinished
+          .map((n) => `${n.node_id} is ${n.node_status}`)
+          .join(", ")}.`,
+      );
+    }
+
     // The deliverable. Previously `final_output` held only the step summaries,
     // so a finished run's actual work product was scattered across node rows
     // with no assembled form. Built from the database, after every node has

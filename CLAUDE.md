@@ -225,3 +225,16 @@ Things that will bite:
 
 - `.claude/skills/*` are **directory junctions** pointing into `.agents/skills/*`. Edit files under `.agents/skills/`; never replace a junction with a real directory. `skills-lock.json` tracks their upstream sources (`google-gemini/gemini-skills`, `shadcn/ui`) with content hashes, so treat these as vendored — regressions belong upstream.
 - `.gemini-agent/` configures a separate Gemini-driven agent (`config.json` sets `specs_dir: ./specs`); `agent_instructions.md` is its system instruction and mirrors this file — keep the two in sync when project conventions change. `specs/{current,archive}/`, `commands/`, `workflows/`, and `logs/` are empty scaffolding for that workflow.
+
+## Dead letters
+
+`src/lib/data/queue.ts`, `src/lib/queue/job-view.ts`, `src/app/dashboard/queue-actions.ts`, migration `…17`. Surfaced on the **Governance & Audit** tab, with a "stalled" badge on the tab nav so a given-up run is visible from anywhere.
+
+- **`fail_agent_job` had been writing `failed` since migration `…15` with nothing reading it.** A run whose worker gave up simply stopped — no view, no count, no way back short of SQL. Same class of defect as the node the engine used to skip silently: work that did not happen, presented as nothing at all.
+- **Retry is an operator action, never automatic.** The queue already retried `max_attempts` times; if the cause were transient it would be finished. A fourth automatic attempt is a loop, not a recovery.
+- `requeue_agent_job` resets `attempts` to 0 but **keeps `last_error`** — it is the only record of why the job died, and clearing it on retry destroys the diagnosis at the moment someone is investigating.
+- It returns an outcome word (`queued` / `already_active` / `not_failed` / `not_found`) rather than raising. `already_active` is checked explicitly instead of letting the `…16` unique index throw: an operator retrying a run someone else already restarted has not done anything wrong.
+- The action verifies membership **and** that the submitted `jobId` belongs to that workspace. Membership proves rights over the workspace, not over an arbitrary id the client supplied.
+- **`executePending` now refuses to mark a graph completed while any node is not `completed`.** The node loop `continue`s past anything not `pending`, so a node left `failed` (human rejection, injection block) fell through to an unconditional "completed" — verified: the same graph reports `completed` without the guard and `Cannot complete: task_02 is failed.` with it, and would have assembled a deliverable from the surviving nodes. Unreachable until a failed graph could be re-entered, which the requeue path introduces.
+- **`job-view.ts` carries the queue's types and `isLeaseExpired` with no `server-only` marker.** The panel is a Client Component; importing a *value* from `lib/data/queue.ts` dragged `next/headers` into the browser bundle. `tsc` and eslint both pass on that — only the bundler catches it. Same split as `lib/rag/chunk.ts`.
+- A `running` job past its lease is shown as "lease expired · reclaimable", not as running (false) or as an error (also false — the next claim recovers it).

@@ -5,6 +5,7 @@ import GovernanceControlPlane from "@/components/dashboard/GovernanceControlPlan
 import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
 import McpToolRegistry from "@/components/dashboard/McpToolRegistry";
 import OutcomeAttribution from "@/components/dashboard/OutcomeAttribution";
+import QueueHealthPanel from "@/components/dashboard/QueueHealthPanel";
 import SopWorkbench from "@/components/dashboard/SopWorkbench";
 import DagTraceVisualizer from "@/components/dashboard/DagTraceVisualizer";
 import HitlQueueDashboard from "@/components/dashboard/HitlQueueDashboard";
@@ -33,6 +34,7 @@ import {
 } from "@/lib/data/governance";
 import { getBudgetStatus } from "@/lib/data/finops";
 import { getMcpServers, getMcpTools } from "@/lib/data/mcp";
+import { countDeadLetters, getQueueHealth } from "@/lib/data/queue";
 import { getTrainingModules } from "@/lib/data/workforce";
 import { resolveActiveWorkspace } from "@/lib/data/workspaces";
 
@@ -66,12 +68,17 @@ export default async function EnterpriseDashboardPage({
   const { active, all } = await resolveActiveWorkspace(requestedWorkspace);
 
   // Header counters are always shown, so they load regardless of active tab.
-  const [pendingHitlCount, activeDagRuns, roi, budget] = await Promise.all([
-    countPendingGates(active.id),
-    countActiveExecutions(active.id),
-    getRoiSummary(active.id),
-    getBudgetStatus(active.id),
-  ]);
+  const [pendingHitlCount, activeDagRuns, roi, budget, deadLetterCount] =
+    await Promise.all([
+      countPendingGates(active.id),
+      countActiveExecutions(active.id),
+      getRoiSummary(active.id),
+      getBudgetStatus(active.id),
+      // On every tab, not just Governance: a run the queue gave up on is
+      // invisible otherwise, which is the whole failure this counter exists to
+      // prevent. An operator should not have to go looking for it.
+      countDeadLetters(active.id),
+    ]);
 
   const tabHref = (key: TabKey) =>
     `/dashboard?tab=${key}&workspace=${active.id}`;
@@ -191,6 +198,11 @@ export default async function EnterpriseDashboardPage({
                       {pendingHitlCount}
                     </span>
                   )}
+                  {key === "governance" && deadLetterCount > 0 && (
+                    <span className="ml-2 rounded-full border border-rose-500/40 bg-rose-500/20 px-2 py-0.5 text-xs font-bold text-rose-400">
+                      {deadLetterCount} stalled
+                    </span>
+                  )}
                   {key === "dag" && (
                     <span className="ml-1 rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2 py-0.5 text-xs text-cyan-400">
                       {activeDagRuns} Live
@@ -262,22 +274,36 @@ async function GovernanceTab({
 }) {
   const canReadLedger = LEDGER_ROLES.includes(viewerRole);
 
-  const [events, ledger, verification] = await Promise.all([
+  const [events, ledger, verification, queue] = await Promise.all([
     getGuardrailEvents(workspaceId),
     canReadLedger ? getLedgerEntries(workspaceId) : Promise.resolve([]),
     canReadLedger ? verifyLedgerChain(workspaceId) : Promise.resolve(null),
+    // Queue rows are readable by every member (migration ...15) — seeing that
+    // a run stalled is not a privileged fact. Restarting one is, which the
+    // action enforces separately.
+    getQueueHealth(workspaceId),
   ]);
 
   return (
-    <GovernanceControlPlane
-      events={events}
-      tallies={tallyGates(events)}
-      ledger={ledger}
-      verification={verification}
-      canReadLedger={canReadLedger}
-    />
+    <>
+      <QueueHealthPanel
+        workspaceId={workspaceId}
+        health={queue}
+        canRetry={REQUEUE_ROLES.includes(viewerRole)}
+      />
+      <GovernanceControlPlane
+        events={events}
+        tallies={tallyGates(events)}
+        ledger={ledger}
+        verification={verification}
+        canReadLedger={canReadLedger}
+      />
+    </>
   );
 }
+
+/** Mirrors REQUEUE_ROLES in queue-actions.ts, which is the enforcing copy. */
+const REQUEUE_ROLES = ["workspace_owner", "ai_administrator", "agent_operator"];
 
 /** Roles that may draft procedures and record commercial measurements. */
 const REPORTING_ROLES = ["workspace_owner", "ai_administrator"];
