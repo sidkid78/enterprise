@@ -77,7 +77,7 @@ export async function resolveGate(
     .update(update)
     .eq("id", gateId)
     .eq("status", "pending")
-    .select("id, graph_execution_id");
+    .select("id, graph_execution_id, workspace_id");
 
   if (error) {
     return { ok: false, error: error.message };
@@ -97,14 +97,29 @@ export async function resolveGate(
   const graphExecutionId = (data[0] as { graph_execution_id: string })
     .graph_execution_id;
 
+  // Dispatch rather than drive. The reviewer's click does not hold a connection
+  // open for however long the rest of the graph takes — it queues the
+  // continuation and returns. The worker picks up the same persisted state and
+  // carries on from the halted node.
+  const workspaceId = (data[0] as { workspace_id: string }).workspace_id;
+
   let resumeMessage: string | null = null;
   try {
-    const { resumeGraph } = await import("@/lib/genai/orchestrator");
-    const result = await resumeGraph(graphExecutionId);
-    resumeMessage = result.message;
+    const { enqueueJob } = await import("@/lib/queue/jobs");
+    const { createServiceClient } = await import("@/lib/supabase/service");
+
+    const { error: queueError } = await enqueueJob(createServiceClient(), {
+      workspaceId,
+      graphExecutionId,
+      jobType: "resume",
+    });
+
+    resumeMessage = queueError
+      ? `Decision saved, but queueing the continuation failed: ${queueError}`
+      : "Decision saved. The run continues in the background.";
   } catch (err) {
     // The human's decision is already committed and must not be rolled back
-    // because the runtime failed. Surface it and leave the record intact.
+    // because the queue failed. Surface it and leave the record intact.
     resumeMessage =
       err instanceof Error
         ? `Decision saved, but resuming failed: ${err.message}`

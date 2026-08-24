@@ -1,6 +1,12 @@
 import "server-only";
 
-import { MODEL_TIERS, estimateCostUsd, getGenAI, normalizeUsage } from "@/lib/genai/client";
+import {
+  MODEL_TIERS,
+  estimateCostUsd,
+  getGenAI,
+  normalizeUsage,
+  withModelTimeout,
+} from "@/lib/genai/client";
 
 /**
  * Gate 3 — critic review of a worker's output.
@@ -65,12 +71,13 @@ export async function reviewOutput(params: {
   const model = MODEL_TIERS.cheap;
 
   try {
-    const interaction = await client.interactions.create({
-      model,
-      // Deliberately NOT chained to the worker's interaction: an independent
-      // context is the point. Inheriting the worker's turn would let the
-      // reasoning that produced a bad output also justify it.
-      input: [
+    const interaction = await withModelTimeout(
+      client.interactions.create({
+        model,
+        // Deliberately NOT chained to the worker's interaction: an independent
+        // context is the point. Inheriting the worker's turn would let the
+        // reasoning that produced a bad output also justify it.
+        input: [
         `Objective given to the worker:\n${params.objective}`,
         `Context available to it:\n${params.context || "(none)"}`,
         params.retrievalAvailable
@@ -78,19 +85,21 @@ export async function reviewOutput(params: {
           : "No knowledge base was searched for this step. The worker had no customer records available and was asked to work from general professional practice.",
         `Output it produced:\n${JSON.stringify(params.output).slice(0, 4000)}`,
         "Does this output assert anything about the customer that it could not know?",
-      ].join("\n\n"),
-      system_instruction:
+        ].join("\n\n"),
+        system_instruction:
         "You are a critic in an enterprise governance pipeline. Judge two kinds of claim differently.\n\n" +
         "Claims about THIS customer — their data, systems, records, accounts, people, or figures — must trace to the supplied context. Anything specific that is not there is fabricated: flag it and score it high.\n\n" +
         "General professional knowledge — standard methodology, framework structure, industry-typical ranges, well-known practice — is what the worker is expected to supply from expertise. Do not flag it merely for being absent from the context.\n\n" +
         "Risk score is the chance that acting on this output would mislead. An output built entirely from general practice, asserting nothing about the customer's actual data, is low risk even when the context is empty.\n\n" +
         "Be strict about the first kind: escalating a correct answer is cheap, approving a fabricated customer fact is not.",
-      response_format: {
-        type: "text",
-        mime_type: "application/json",
-        schema: CRITIC_SCHEMA,
-      },
-    });
+        response_format: {
+          type: "text",
+          mime_type: "application/json",
+          schema: CRITIC_SCHEMA,
+        },
+        }),
+      "critic review",
+    );
 
     const usage = normalizeUsage(interaction.usage);
     const costUsd = estimateCostUsd(model, usage.inputTokens, usage.outputTokens);

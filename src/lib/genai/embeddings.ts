@@ -1,6 +1,6 @@
 import "server-only";
 
-import { EMBEDDING_MODEL, getGenAI } from "./client";
+import { EMBEDDING_MODEL, getGenAI, withModelTimeout } from "./client";
 
 /**
  * Must match the vector(768) column in semantic_cache. Changing this requires a
@@ -74,14 +74,17 @@ export async function embedBatch(
 
   const client = getGenAI();
 
-  const response = await client.models.embedContent({
-    model: EMBEDDING_MODEL,
-    contents: texts,
-    config: {
-      outputDimensionality: EMBEDDING_DIMENSIONS,
-      taskType: task,
-    },
-  });
+  const response = await withModelTimeout(
+    client.models.embedContent({
+      model: EMBEDDING_MODEL,
+      contents: texts,
+      config: {
+        outputDimensionality: EMBEDDING_DIMENSIONS,
+        taskType: task,
+      },
+    }),
+    `embedding ${texts.length} text(s)`,
+  );
 
   const embeddings = response.embeddings ?? [];
 

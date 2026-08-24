@@ -52,7 +52,13 @@ type WorkerOutput = {
   risk_factors?: string[];
 };
 
-export type RunStatus = "completed" | "waiting_hitl" | "failed" | "halted_finops";
+export type RunStatus =
+  /** Created and queued; a worker has not picked it up yet. */
+  | "pending"
+  | "completed"
+  | "waiting_hitl"
+  | "failed"
+  | "halted_finops";
 
 export type RunResult = {
   graphExecutionId: string;
@@ -510,6 +516,24 @@ async function executePending(
       message: `Halted before ${atNode}: budget exhausted at ${formatUsd(budget.currentSpendUsd)} of ${formatUsd(budget.monthlyBudgetUsd)}. Completed steps are preserved and the run can resume once the budget is raised.`,
     };
   };
+
+  // Reclaim nodes interrupted by a previous attempt.
+  //
+  // Node-level idempotency is what makes an at-least-once queue safe: a retry
+  // skips nodes already marked completed rather than redoing them. But the same
+  // rule silently skips a node left `running` when its worker died mid-step —
+  // the graph then finishes with a step that never ran. Observed exactly that:
+  // a 429 killed attempt 1 with task_02 marked running, and attempt 2 completed
+  // the graph without it.
+  //
+  // A `running` node found here is necessarily orphaned: the queue lease means
+  // only one worker drives a given graph at a time, so nothing else is holding
+  // it. Interrupted is not in-flight.
+  await db
+    .from("agent_node_executions")
+    .update({ node_status: "pending" })
+    .eq("graph_execution_id", graphId)
+    .eq("node_status", "running");
 
   const { data: rows, error } = await db
     .from("agent_node_executions")
@@ -1119,19 +1143,17 @@ async function executePending(
  * The caller MUST have already verified the user's membership of workspaceId:
  * this writes with the service role and has no RLS backstop.
  */
-export async function launchGraph(params: {
+export async function createRun(params: {
   workspaceId: string;
   rootPrompt: string;
   userId: string;
 }): Promise<RunResult> {
   const { workspaceId, rootPrompt, userId } = params;
   const db = createServiceClient();
-  const client = getGenAI();
 
-  // --- FinOps gate: refuse to start an over-budget workspace ------------
-  // The same over_budget predicate the database uses mid-run, so the two
-  // cannot drift apart into "the launch gate says yes and the node gate says
-  // no".
+  // The budget gate runs here, in the request, so an over-budget workspace is
+  // told immediately rather than after a round trip through the queue. It runs
+  // again before every node, so nothing is lost by checking early.
   const budget = await readBudget(db, workspaceId);
   const spend = budget?.currentSpendUsd ?? 0;
   const cap = budget?.monthlyBudgetUsd ?? 0;
@@ -1157,29 +1179,94 @@ export async function launchGraph(params: {
     };
   }
 
-  const nodeBudget = Math.min(
-    MAX_NODES,
-    budget?.maxAgentLoopRecursion || MAX_NODES,
-  );
-
-  const { data: graph, error: graphError } = await db
+  // Persisted as `pending`: created, not started. A worker moves it to running.
+  const { data: graph, error } = await db
     .from("agent_graph_executions")
     .insert({
       workspace_id: workspaceId,
       orchestrator_name: "DecompositionOrchestrator",
       framework_type: "interactions_api",
       root_prompt: rootPrompt,
-      status: "running",
+      status: "pending",
       created_by: userId,
     })
-    .select("id, workspace_id, root_interaction_id")
+    .select("id")
     .single();
 
-  if (graphError || !graph) {
-    throw new Error(`Could not create execution: ${graphError?.message}`);
+  if (error || !graph) {
+    throw new Error(`Could not create execution: ${error?.message}`);
   }
 
-  const graphId = graph.id as string;
+  return {
+    graphExecutionId: graph.id as string,
+    status: "pending",
+    message: "Queued. A worker will plan and run it.",
+  };
+}
+
+/**
+ * Plans and runs a graph that has already been created.
+ *
+ * The worker's entry point. Safe to re-enter: planning is skipped when the
+ * graph already has nodes, and executePending only picks up nodes still marked
+ * pending. That matters because the queue is at-least-once — a worker that dies
+ * mid-run has its job reclaimed, and the retry must continue rather than
+ * duplicate. Without the planning guard a retry would insert a second plan and
+ * the run would silently have twice the steps.
+ */
+export async function runGraph(graphExecutionId: string): Promise<RunResult> {
+  const db = createServiceClient();
+  const client = getGenAI();
+
+  const { data: existing } = await db
+    .from("agent_graph_executions")
+    .select("id, workspace_id, root_prompt, root_interaction_id, created_by, status")
+    .eq("id", graphExecutionId)
+    .maybeSingle();
+
+  if (!existing) {
+    return {
+      graphExecutionId,
+      status: "failed",
+      message: "Execution not found.",
+    };
+  }
+
+  const workspaceId = existing.workspace_id as string;
+  const rootPrompt = (existing.root_prompt as string) ?? "";
+  const graphId = graphExecutionId;
+
+  const { count: nodeCount } = await db
+    .from("agent_node_executions")
+    .select("id", { count: "exact", head: true })
+    .eq("graph_execution_id", graphId);
+
+  if ((nodeCount ?? 0) > 0) {
+    // Already planned; this is a retry or a continuation.
+    await db
+      .from("agent_graph_executions")
+      .update({ status: "running" })
+      .eq("id", graphId);
+
+    return await executePending(db, {
+      id: graphId,
+      workspace_id: workspaceId,
+      root_interaction_id: existing.root_interaction_id as string | null,
+      root_prompt: rootPrompt,
+    });
+  }
+
+  const budget = await readBudget(db, workspaceId);
+
+  await db
+    .from("agent_graph_executions")
+    .update({ status: "running" })
+    .eq("id", graphId);
+
+  const nodeBudget = Math.min(
+    MAX_NODES,
+    budget?.maxAgentLoopRecursion || MAX_NODES,
+  );
 
   // === GATE 1 on the root prompt ======================================
   // This is the one piece of genuinely user-supplied text in the pipeline, so

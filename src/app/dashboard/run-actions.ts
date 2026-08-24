@@ -2,7 +2,9 @@
 
 import { revalidatePath } from "next/cache";
 
-import { launchGraph } from "@/lib/genai/orchestrator";
+import { createRun } from "@/lib/genai/orchestrator";
+import { enqueueJob } from "@/lib/queue/jobs";
+import { createServiceClient } from "@/lib/supabase/service";
 import { createClient } from "@/lib/supabase/server";
 
 export type LaunchState = { error: string | null; message: string | null };
@@ -63,13 +65,36 @@ export async function launchRun(
   }
 
   try {
-    const result = await launchGraph({
+    // Create, then dispatch. The request does no model work at all — planning
+    // is a model call and belongs to the worker, so a slow planner cannot time
+    // out the operator's click.
+    const result = await createRun({
       workspaceId,
       rootPrompt,
       userId: userId as string,
     });
+
+    if (result.status !== "pending") {
+      // Refused before it started, e.g. the budget gate. Nothing to queue.
+      revalidatePath("/dashboard");
+      return { error: null, message: result.message };
+    }
+
+    const { error: queueError } = await enqueueJob(createServiceClient(), {
+      workspaceId,
+      graphExecutionId: result.graphExecutionId,
+      jobType: "launch",
+    });
+
+    if (queueError) {
+      return { error: `Could not queue the run: ${queueError}`, message: null };
+    }
+
     revalidatePath("/dashboard");
-    return { error: null, message: result.message };
+    return {
+      error: null,
+      message: `Queued as ${result.graphExecutionId.slice(0, 8)}. It will start as soon as a worker is free.`,
+    };
   } catch (err) {
     return {
       error: err instanceof Error ? err.message : "Run failed to start.",

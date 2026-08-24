@@ -8,7 +8,12 @@ import {
 import { screenForInjection } from "@/lib/governance/injection";
 import { maskDeep } from "@/lib/governance/pii";
 
-import { getGenAI, normalizeUsage, type NormalizedUsage } from "./client";
+import {
+  getGenAI,
+  normalizeUsage,
+  withModelTimeout,
+  type NormalizedUsage,
+} from "./client";
 
 /**
  * One worker turn, including any tool calls the model makes along the way.
@@ -187,7 +192,10 @@ export async function runWorkerTurn(
       ...declarations,
     } as unknown as Parameters<typeof params.client.interactions.create>[0];
 
-    const interaction = (await params.client.interactions.create(request)) as unknown as {
+    const interaction = (await withModelTimeout(
+      params.client.interactions.create(request),
+      `worker turn (${params.model}, hop ${hop})`,
+    )) as unknown as {
       id: string;
       usage?: unknown;
       output_text?: string | null;

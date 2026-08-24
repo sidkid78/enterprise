@@ -141,6 +141,20 @@ Parent/child: chunks are embedded small so retrieval is precise, and what the wo
 - Tool loops multiply requests per run — plan, per-node turns, each tool hop, plus the critic. This hits the Gemini free tier's 20/min limit quickly.
 - The **Tool Access** dashboard tab (`McpToolRegistry`) registers servers, runs discovery, and flips the three per-tool switches. Every member can read the registry — seeing what agents can reach is the point — while only `workspace_owner` / `ai_administrator` may change it, enforced by RLS as well as by the Server Action.
 
+## Queue and workers
+
+`src/lib/queue/`, `scripts/worker.ts`, migration `…15`. Run the worker alongside the app: `npm run worker`.
+
+The engine did not change — every node was already persisted as it completed — so this is a change of caller. `createRun()` inserts a `pending` execution and returns (no model call; planning belongs to the worker). `runGraph()` / `resumeGraph()` are the worker's entry points. A HITL approval **dispatches** a resume job instead of driving the continuation on the reviewer's connection.
+
+- **Delivery is at-least-once.** A worker that dies holds nothing once `locked_until` passes, so every step must be safe to re-enter.
+- **Planning is guarded by node count.** Without it a retry inserts a second plan and the run silently has twice the steps.
+- **Nodes left `running` are reset to `pending` on re-entry.** Node-level idempotency makes retry safe from duplication, but the same rule silently *skips* a node whose worker died mid-step — observed exactly that: a 429 killed attempt 1 with `task_02` marked running, and attempt 2 marked the graph complete without it. A `running` node found at entry is orphaned by definition, since the lease means one worker per graph.
+- **`waiting_hitl` is a job success, not a failure.** Retrying it would find the same gate and stall until attempts ran out.
+- **Model calls have a timeout** (`withModelTimeout`, `GENAI_TIMEOUT_MS`, default 120s). Inline, a hung provider call died with the request; on a worker it holds the lease for its full 15 minutes. Seen live — a job sat `running` for eight minutes with no tokens logged and no CPU burned.
+- The worker needs `--conditions react-server` so the `server-only` marker resolves to its empty module; without it Node takes the default export, which throws by design.
+- Not pgmq (available, 1.5.1): its messages are an opaque store beside `agent_graph_executions`, and the dashboard would need a second lookup to tell "queued" from "running". A job row referencing the execution keeps one story and is ~40 lines of `FOR UPDATE SKIP LOCKED`.
+
 ## Workforce and BIO (Pillars 6-7)
 
 `src/lib/workforce/sop.ts`, `src/app/dashboard/outcome-actions.ts`. Both tables were readable from the start and had no writer, which is why the ROI tab showed $0.00 for so long.

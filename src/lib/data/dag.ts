@@ -228,7 +228,9 @@ export async function countActiveExecutions(
     .from("agent_graph_executions")
     .select("id", { count: "exact", head: true })
     .eq("workspace_id", workspaceId)
-    .in("status", ["running", "waiting_hitl"]);
+    // "pending" counts as live: the run exists and is queued, and showing it
+    // only once a worker picks it up would make a busy queue look idle.
+    .in("status", ["pending", "running", "waiting_hitl"]);
 
   if (error) {
     throw new Error(`Failed to count executions: ${error.message}`);

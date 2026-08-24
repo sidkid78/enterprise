@@ -113,3 +113,47 @@ export function normalizeUsage(usage: unknown): NormalizedUsage {
     totalTokens: num(u.total_tokens),
   };
 }
+
+/**
+ * Wall-clock ceiling for one model call.
+ *
+ * Generous, because a reasoning-tier call on a long context legitimately takes
+ * a while — but bounded, because unbounded is worse. Inline, a hung provider
+ * call died with the request that made it. On a worker it holds the queue lease
+ * for its full duration, so one wedged call takes a worker out of service for
+ * fifteen minutes. Observed exactly that: a job sat `running` under a valid
+ * lease for eight minutes with no tokens logged and no CPU burned.
+ */
+export const MODEL_CALL_TIMEOUT_MS = Number(
+  process.env.GENAI_TIMEOUT_MS ?? 120_000,
+);
+
+/**
+ * Rejects if a model call outlives its budget.
+ *
+ * Does not cancel the underlying request — the SDK exposes no signal — so the
+ * call may still complete somewhere and be discarded. That is the right trade:
+ * a duplicated, ignored call costs tokens, while a wedged worker costs
+ * availability, and the queue retries at node granularity anyway.
+ */
+export async function withModelTimeout<T>(
+  promise: Promise<T>,
+  label: string,
+  timeoutMs = MODEL_CALL_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out after ${timeoutMs}ms.`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
