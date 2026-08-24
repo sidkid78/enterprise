@@ -34,7 +34,11 @@ import {
 } from "@/lib/data/governance";
 import { getBudgetStatus } from "@/lib/data/finops";
 import { getMcpServers, getMcpTools } from "@/lib/data/mcp";
-import { countDeadLetters, getQueueHealth } from "@/lib/data/queue";
+import {
+  countDeadLetters,
+  getQueueHealth,
+  getWorkerFleet,
+} from "@/lib/data/queue";
 import { getTrainingModules } from "@/lib/data/workforce";
 import { resolveActiveWorkspace } from "@/lib/data/workspaces";
 
@@ -274,7 +278,7 @@ async function GovernanceTab({
 }) {
   const canReadLedger = LEDGER_ROLES.includes(viewerRole);
 
-  const [events, ledger, verification, queue] = await Promise.all([
+  const [events, ledger, verification, queue, workers] = await Promise.all([
     getGuardrailEvents(workspaceId),
     canReadLedger ? getLedgerEntries(workspaceId) : Promise.resolve([]),
     canReadLedger ? verifyLedgerChain(workspaceId) : Promise.resolve(null),
@@ -282,6 +286,9 @@ async function GovernanceTab({
     // a run stalled is not a privileged fact. Restarting one is, which the
     // action enforces separately.
     getQueueHealth(workspaceId),
+    // Fleet-wide, not workspace-scoped: one worker drains every tenant, so
+    // "is anything running?" has the same answer for all of them.
+    getWorkerFleet(),
   ]);
 
   return (
@@ -289,7 +296,9 @@ async function GovernanceTab({
       <QueueHealthPanel
         workspaceId={workspaceId}
         health={queue}
+        workers={workers}
         canRetry={REQUEUE_ROLES.includes(viewerRole)}
+        renderedAt={queue.observedAt}
       />
       <GovernanceControlPlane
         events={events}
