@@ -38,8 +38,25 @@ export async function enqueueJob(
     .select("id")
     .single();
 
-  if (error) return { jobId: null, error: error.message };
-  return { jobId: data.id as string, error: null };
+  if (!error) return { jobId: data.id as string, error: null };
+
+  // A graph may have only one active job (migration ...16), which is what makes
+  // "a node found running is orphaned" true. Hitting that is not a failure:
+  // something is already scheduled to drive this graph, which is precisely what
+  // the caller wanted. Two operators resolving gates on the same run, or one
+  // double-clicking, should not see a constraint violation.
+  if (error.code === "23505") {
+    const { data: existing } = await db
+      .from("agent_job_queue")
+      .select("id")
+      .eq("graph_execution_id", params.graphExecutionId)
+      .in("status", ["queued", "running"])
+      .maybeSingle();
+
+    return { jobId: (existing?.id as string) ?? null, error: null };
+  }
+
+  return { jobId: null, error: error.message };
 }
 
 /**
