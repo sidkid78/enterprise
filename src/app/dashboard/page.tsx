@@ -1,6 +1,7 @@
 import Link from "next/link";
 
 import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercialization";
+import GovernanceControlPlane from "@/components/dashboard/GovernanceControlPlane";
 import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
 import McpToolRegistry from "@/components/dashboard/McpToolRegistry";
 import DagTraceVisualizer from "@/components/dashboard/DagTraceVisualizer";
@@ -16,6 +17,13 @@ import {
   getKnowledgeBases,
   getKnowledgeDocuments,
 } from "@/lib/data/knowledge";
+import {
+  getGuardrailEvents,
+  getLedgerEntries,
+  tallyGates,
+  verifyLedgerChain,
+  LEDGER_ROLES,
+} from "@/lib/data/governance";
 import { getMcpServers, getMcpTools } from "@/lib/data/mcp";
 import { getTrainingModules } from "@/lib/data/workforce";
 import { resolveActiveWorkspace } from "@/lib/data/workspaces";
@@ -25,6 +33,7 @@ const TABS = [
   { key: "dag", label: "DAG Execution Visualizer" },
   { key: "knowledge", label: "Domain Knowledge" },
   { key: "tools", label: "Tool Access" },
+  { key: "governance", label: "Governance & Audit" },
   { key: "upskilling", label: "Workforce Enablement & SOPs" },
   { key: "bio", label: "BIO ROI & SLA Billing" },
 ] as const;
@@ -174,6 +183,9 @@ export default async function EnterpriseDashboardPage({
             tools={await getMcpTools(active.id)}
           />
         )}
+        {tab === "governance" && (
+          <GovernanceTab workspaceId={active.id} viewerRole={active.role} />
+        )}
         {tab === "upskilling" && (
           <WorkforceUpskillingHub
             workspaceName={active.name}
@@ -188,5 +200,38 @@ export default async function EnterpriseDashboardPage({
         )}
       </main>
     </div>
+  );
+}
+
+/**
+ * Governance tab data.
+ *
+ * Split out so the ledger queries are skipped for roles the RLS policy would
+ * return nothing to anyway — asking and getting zero rows would render as "no
+ * entries recorded", which is a different and misleading claim.
+ */
+async function GovernanceTab({
+  workspaceId,
+  viewerRole,
+}: {
+  workspaceId: string;
+  viewerRole: string;
+}) {
+  const canReadLedger = LEDGER_ROLES.includes(viewerRole);
+
+  const [events, ledger, verification] = await Promise.all([
+    getGuardrailEvents(workspaceId),
+    canReadLedger ? getLedgerEntries(workspaceId) : Promise.resolve([]),
+    canReadLedger ? verifyLedgerChain(workspaceId) : Promise.resolve(null),
+  ]);
+
+  return (
+    <GovernanceControlPlane
+      events={events}
+      tallies={tallyGates(events)}
+      ledger={ledger}
+      verification={verification}
+      canReadLedger={canReadLedger}
+    />
   );
 }

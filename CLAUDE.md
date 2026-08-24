@@ -141,6 +141,16 @@ Parent/child: chunks are embedded small so retrieval is precise, and what the wo
 - Tool loops multiply requests per run — plan, per-node turns, each tool hop, plus the critic. This hits the Gemini free tier's 20/min limit quickly.
 - The **Tool Access** dashboard tab (`McpToolRegistry`) registers servers, runs discovery, and flips the three per-tool switches. Every member can read the registry — seeing what agents can reach is the point — while only `workspace_owner` / `ai_administrator` may change it, enforced by RLS as well as by the Server Action.
 
+## Governance visibility
+
+The **Governance & Audit** tab reads `guardrail_events` and `agent_audit_ledger`, which the runtime had been writing since Phase 5 with nothing reading them.
+
+- `verify_ledger_chain(workspace_id)` **recomputes** the SHA-256 chain from the stored payloads rather than reading a status column, so a claim of integrity is earned per request. Its hash input must stay identical to `private.compute_ledger_hash`: `previous_hash || sequence_id::text || workspace_id::text || payload::text`. Change one and you must change the other.
+- It is `SECURITY INVOKER`, so it verifies only what the caller may already read. As DEFINER it would turn "verify my own chain" into "read every tenant's".
+- The ledger is restricted to `workspace_owner` / `ai_administrator` / `compliance_auditor`; guardrail events are visible to every member. The tab **skips the ledger queries entirely** for other roles rather than querying and getting zero rows — "no entries recorded" and "not yours to read" are different claims, and a verification the viewer cannot perform must never render as a pass.
+
+**TRUNCATE defeated the append-only ledger.** `enforce_immutable_ledger` is `FOR EACH ROW`, and TRUNCATE fires no row triggers and consults no RLS; Supabase's default privileges grant it to `authenticated`. Confirmed by test: `set role authenticated; truncate agent_audit_ledger;` removed every row silently. Not reachable through PostgREST (no TRUNCATE verb), so it was a defence-in-depth failure rather than a live exploit. Migration `…12` adds a **statement-level** TRUNCATE trigger — which cannot be granted around — and revokes TRUNCATE from `anon`/`authenticated` across the schema.
+
 ## Governance gates
 
 `src/lib/governance/` — `pii.ts`, `injection.ts`, `critic.ts`. Every gate writes a `guardrail_events` row.
