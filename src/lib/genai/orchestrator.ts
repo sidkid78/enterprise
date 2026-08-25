@@ -2,6 +2,10 @@ import "server-only";
 
 import { CRITIC_RISK_THRESHOLD, reviewOutput } from "@/lib/governance/critic";
 import { screenForInjection } from "@/lib/governance/injection";
+import {
+  evaluateGateTriggers,
+  CONFIDENCE_THRESHOLD as GATE_CONFIDENCE_THRESHOLD,
+} from "@/lib/governance/triggers";
 import { maskDeep, maskPii } from "@/lib/governance/pii";
 import { createServiceClient } from "@/lib/supabase/service";
 
@@ -30,7 +34,11 @@ import {
 } from "./client";
 
 /** Below this, a node hands off to a human instead of committing its output. */
-const CONFIDENCE_THRESHOLD = 0.7;
+/*
+ * Re-exported from the trigger evaluator so there is one definition. The other
+ * three thresholds live beside it; see lib/governance/triggers.ts.
+ */
+const CONFIDENCE_THRESHOLD = GATE_CONFIDENCE_THRESHOLD;
 
 /** Hard ceiling on plan size, independent of the per-workspace recursion cap. */
 const MAX_NODES = 6;
@@ -43,6 +51,8 @@ type PlannedStep = {
   objective: string;
   depends_on: string[];
   tier: ModelTier;
+  /** See PLAN_SCHEMA.requires_hitl_check. */
+  requires_hitl_check?: boolean;
 };
 
 type WorkerOutput = {
@@ -50,6 +60,9 @@ type WorkerOutput = {
   confidence: number;
   result: Record<string, unknown>;
   risk_factors?: string[];
+  /** Gate inputs. Absent when the step had no such content to report. */
+  monetary_value_usd?: number;
+  sentiment_score?: number;
 };
 
 export type RunStatus =
@@ -98,8 +111,18 @@ const PLAN_SCHEMA = {
             description:
               "cheap for extraction/routing, default for ordinary work, reasoning only for genuinely hard analysis.",
           },
+          /*
+           * Decided at decomposition rather than by the worker, so a step's
+           * blast radius is not self-assessed by the thing performing it. A
+           * node marked here escalates regardless of how well it went.
+           */
+          requires_hitl_check: {
+            type: "boolean",
+            description:
+              "True if this step writes to an external system of record — creating or modifying records in ERP, CRM, ledgers, databases, or issuing payments, orders, or messages to third parties. False for analysis, drafting, extraction, and summarisation that only produce text.",
+          },
         },
-        required: ["node_id", "agent_role", "objective", "depends_on", "tier"],
+        required: ["node_id", "agent_role", "objective", "depends_on", "tier", "requires_hitl_check"],
       },
     },
   },
@@ -155,6 +178,25 @@ const WORKER_SCHEMA = {
         },
       },
       required: ["heading", "content_markdown"],
+    },
+    /*
+     * Gate inputs, declared at the top level beside `confidence` because they
+     * are evaluation signals rather than part of the deliverable.
+     *
+     * Neither is `required`. Forcing them would make a model that has no
+     * monetary or sentiment content invent a number to satisfy the schema, and
+     * a fabricated $0 is indistinguishable from a real one — the gate would
+     * then be deciding on evidence the worker made up to fill a field.
+     */
+    monetary_value_usd: {
+      type: "number",
+      description:
+        "Total US dollars this step commits, transacts, or recommends paying out. Omit entirely when the step moves no money. Never estimate — report only a figure the step actually determined.",
+    },
+    sentiment_score: {
+      type: "number",
+      description:
+        "Sentiment of stakeholder communication this step assessed, from -1 (extremely negative) to 1 (extremely positive). Omit entirely when the step assessed no such communication.",
     },
     risk_factors: { type: "array", items: { type: "string" } },
   },
@@ -385,6 +427,8 @@ type NodeRow = {
   model_routing_used: string;
   input_payload: {
     objective?: string;
+    /** Set at decomposition; see PLAN_SCHEMA.requires_hitl_check. */
+    requiresHitlCheck?: boolean;
     /**
      * Staged by applyApprovedToolCall. Its presence means this node is not
      * starting over — it is continuing the interaction that asked for the tool.
@@ -641,6 +685,18 @@ async function executePending(
         primaryCause: string;
         riskFactors: string[];
         output: Record<string, unknown>;
+        /**
+         * Which role may resolve this gate. Every gate used to require
+         * `agent_operator`, so authorising a large payment and confirming a
+         * summary looked right were the same act by the same person.
+         */
+        requiredRole?: string;
+        /** The confidence check, shown to the reviewer rather than implied. */
+        confidenceBreakdown?: {
+          score: number | null;
+          threshold: number;
+          passed: boolean;
+        };
       }): Promise<RunResult> => {
         await db.from("hitl_approval_gates").insert({
           workspace_id: workspaceId,
@@ -648,11 +704,12 @@ async function executePending(
           node_execution_id: node.id,
           trigger_reason: params.reason,
           confidence_score: params.confidence,
-          required_role: "agent_operator",
+          required_role: params.requiredRole ?? "agent_operator",
           reasoning_log_summary: {
             primaryCause: params.primaryCause,
             triggerDescription: `Objective: ${objective}`,
             riskFactors: params.riskFactors,
+            confidenceBreakdown: params.confidenceBreakdown ?? null,
           },
           input_payload: { objective },
           output_payload: params.output,
@@ -1018,8 +1075,39 @@ async function executePending(
       }
 
       const criticFlagged = !!critic && critic.riskScore >= CRITIC_RISK_THRESHOLD;
-      const needsHuman =
-        !structurallyValid || confidence < CONFIDENCE_THRESHOLD || criticFlagged;
+
+      /*
+       * The four specified triggers, evaluated together. Confidence used to be
+       * the only one, which meant a confident agent could commit any amount of
+       * money and write to any system of record unattended — the two cases the
+       * gate most needs to catch, since being sure is not the same as being
+       * authorised.
+       *
+       * A number the worker reports about itself is weak evidence, so the
+       * monetary and sentiment fields are optional in the schema and absence is
+       * treated as "nothing to declare" rather than as zero. The mutation flag
+       * deliberately does NOT come from the worker: the planner sets it, so a
+       * step cannot decide for itself that it is harmless.
+       */
+      const gate = evaluateGateTriggers({
+        agentRole: node.agent_role,
+        confidence: structurallyValid ? confidence : null,
+        structurallyValid,
+        criticFlagged,
+        criticRisk: critic?.riskScore ?? null,
+        monetaryValueUsd:
+          typeof output?.monetary_value_usd === "number"
+            ? output.monetary_value_usd
+            : null,
+        sentimentScore:
+          typeof output?.sentiment_score === "number"
+            ? output.sentiment_score
+            : null,
+        requiresHitlCheck: node.input_payload?.requiresHitlCheck === true,
+        workerRiskFactors: output?.risk_factors ?? [],
+      });
+
+      const needsHuman = gate.requiresHitl;
 
       await db
         .from("agent_node_executions")
@@ -1067,24 +1155,13 @@ async function executePending(
       });
 
       if (needsHuman) {
-        const primaryCause = !structurallyValid
-          ? "Model output failed structural validation."
-          : criticFlagged
-            ? `Critic flagged this output as ungrounded (risk ${critic!.riskScore.toFixed(2)}).`
-            : `${node.agent_role} reported ${(confidence * 100).toFixed(0)}% confidence, below the ${CONFIDENCE_THRESHOLD * 100}% threshold.`;
-
         return await escalate({
-          reason: !structurallyValid
-            ? "unparseable_output"
-            : criticFlagged
-              ? "critic_flagged"
-              : "low_confidence_score",
+          reason: gate.reason ?? "low_confidence_score",
+          requiredRole: gate.requiredRole,
           confidence: structurallyValid ? confidence : null,
-          primaryCause,
-          riskFactors: [
-            ...(output?.risk_factors ?? []),
-            ...(critic?.concerns ?? []),
-          ],
+          primaryCause: gate.primaryCause ?? "This step needs human review.",
+          riskFactors: [...gate.riskFactors, ...(critic?.concerns ?? [])],
+          confidenceBreakdown: gate.confidenceBreakdown,
           output: structurallyValid ? (output!.result ?? {}) : {},
         });
       }
@@ -1438,7 +1515,13 @@ export async function runGraph(graphExecutionId: string): Promise<RunResult> {
         node_id: step.node_id,
         agent_role: step.agent_role,
         model_routing_used: MODEL_TIERS[step.tier],
-        input_payload: { objective: step.objective },
+        input_payload: {
+          objective: step.objective,
+          // Carried from the plan so it survives a resume: the flag is decided
+          // once, at decomposition, and a continuation must gate on the same
+          // judgement the original plan made.
+          requiresHitlCheck: step.requires_hitl_check === true,
+        },
         node_status: "pending",
         depends_on: step.depends_on,
       })),

@@ -272,3 +272,21 @@ Before this the only evidence a worker existed was `agent_job_queue.locked_by` o
 **A human rejection was being retried as a failure.** `resumeGraph` returned `failed` for a rejected gate, so the worker re-queued it, re-read the same rejection three times, and dead-lettered the run — presenting a reviewer's deliberate "no" to the operator as a platform breakdown. Verified before fixing. There is now a `rejected` RunStatus that the worker completes rather than retries, for exactly the reason `waiting_hitl` is a job success. Any new terminal outcome the engine can reach needs the same treatment.
 
 **Incidents are recorded once, at dead-letter, not per failed attempt.** A transient failure the queue retried successfully is the system working; counting it would make the incident log a measure of provider flakiness rather than of what anyone was let down by.
+
+## HITL trigger evaluation
+
+`src/lib/governance/triggers.ts`. The four triggers and their numeric boundaries come from **`ai_docs` (Drive) → Stateful HITL Gates → `Trigger-Evaluation.pdf`**, not from invention. Only the confidence one existed before.
+
+| Trigger | Boundary | Resolves as |
+| --- | --- | --- |
+| `low_confidence_score` | < 0.70 | `agent_operator` |
+| `financial_threshold_exceeded` | > $10,000.00 | `ai_administrator` |
+| `negative_sentiment_detected` | < -0.75 | `agent_operator` |
+| `external_system_mutation` | planner flag | `ai_administrator` |
+
+- **Order is load-bearing and comes from the spec's worked examples.** A $14,500 payout at 0.64 confidence reports as `financial_threshold_exceeded` routed to an administrator, *not* as low confidence. Money is checked before confidence because it is the trigger that fires on a **confident** agent — being sure is not the same as being authorised.
+- **`requires_hitl_check` is set by the PLANNER at decomposition, never by the worker.** A step must not be able to decide for itself that its own blast radius is harmless. It is persisted into `input_payload` so a resume gates on the same judgement the original plan made.
+- **`monetary_value_usd` and `sentiment_score` are optional in `WORKER_SCHEMA`, deliberately.** Making them required would force a model with no monetary content to invent a number, and a fabricated `$0` is indistinguishable from a real one — the gate would then be deciding on evidence the worker made up to fill a field. Absent means "nothing to declare", not zero.
+- **Per-trigger `required_role` needed no policy change**: `hitl_resolve` already compares against the `required_role` column, and the column is `user_role_enum`, so an invalid value would be an insert error rather than a silent widening. Both emitted values are enum members.
+- The evaluator is pure and unmarked by `server-only`, so thresholds can be shown in a Client Component. `CONFIDENCE_THRESHOLD` now has one definition, re-exported into the orchestrator.
+- **0.70 is correct and matches the spec.** The `> 0.85` that appears in `SOP Auto Generator.pdf` and the ui-ux mock is inside a *sample SOP body* — a claims-domain rule an operator wrote into a procedure, not the platform threshold. Don't "fix" the constant to match it.
