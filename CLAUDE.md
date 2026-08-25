@@ -43,6 +43,8 @@ The intended full architecture lives as prose/DDL/code blocks in `ai_docs/` and 
 
 The blueprints target Next.js 15 + Supabase; the app is actually on Next.js 16 and has no Supabase dependency installed. Treat the docs as design intent, not as a description of installed reality.
 
+**There is more in Google Drive than in `ai_docs/`.** Folder `ai_docs` (id `1PTCjjbWRzEPuNBuBEBWdo1KpDMnSxGZ1`), reachable with the Google Drive MCP tools, mirrors these six blueprints at its top level and then adds seven subfolders of per-subsystem PDFs that are **not** in the repo — Governance Control Plane (the three gates, the ledger), FinOps Engine (cascade, cache, budget controls, loop guard), Multi-Agent Orchestration (DAG, decomposition, MCP, state persistence), Stateful HITL Gates (triggers, resumption, reasoning logs, RBAC), Advanced Hybrid Rag (parent/child chunking, dense, BM25, RRF), BIO ROI & Upskilling (baselines, outcome logs, SOP generator, gross margin uplift), and Infrastructure & Stack (Next.js, Supabase, GenAI SDK). Search `parentId = '<folder id>'`, then read by file id. Consult these before designing a subsystem they cover. Nothing there covers the queue, the worker fleet, or SLA availability.
+
 ## Architecture
 
 **Routing.** `next.config.ts` permanently redirects `/` → `/dashboard`, so `src/app/page.tsx` (still the untouched create-next-app splash) is dead code. `src/app/dashboard/page.tsx` is the real entry point.
