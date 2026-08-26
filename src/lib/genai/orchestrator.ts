@@ -81,7 +81,20 @@ export type RunStatus =
    * `waiting_hitl` a job success rather than a failure.
    */
   | "rejected"
-  | "halted_finops";
+  | "halted_finops"
+  /**
+   * The graph exceeded its recursion limit — it kept re-entering nodes rather
+   * than finishing.
+   *
+   * Separate from `halted_finops` because the remedy is opposite. A budget halt
+   * is cleared by raising the cap, and the run then completes. Clearing this
+   * one the same way just loops again, so reporting both as "out of budget"
+   * would send an operator to the billing screen for a broken agent.
+   *
+   * Like `halted_finops` and `waiting_hitl`, it is a job SUCCESS: the queue
+   * retrying a run that halted for looping too much is itself a loop.
+   */
+  | "halted_loop_guard";
 
 export type RunResult = {
   graphExecutionId: string;
@@ -408,6 +421,65 @@ async function readBudget(
   };
 }
 
+type NodeAttempt = {
+  allowed: boolean;
+  nodeAttempts: number;
+  graphAttempts: number;
+  /**
+   * Set when the claim could not be taken at all, as distinct from being
+   * refused. The two must not be reported the same way: a refusal means the run
+   * is looping and should stop for good, while this means we do not know, and
+   * telling an operator their agent is in a runaway loop because the database
+   * was briefly unreachable is a false accusation about their agent.
+   */
+  errorMessage: string | null;
+};
+
+/**
+ * Takes one execution attempt for a node against the workspace recursion limit.
+ *
+ * Fails CLOSED. If the RPC errors the node does not run: the whole point of
+ * this guard is that an unbounded loop is expensive, and a guard that quietly
+ * stops guarding when the database hiccups protects nothing on exactly the runs
+ * where it matters. The same reasoning makes the critic gate escalate rather
+ * than pass when it errors.
+ */
+async function claimNodeAttempt(
+  db: Db,
+  nodeExecutionId: string,
+  limit: number,
+): Promise<NodeAttempt> {
+  const { data, error } = await db.rpc("claim_node_attempt", {
+    p_node_execution_id: nodeExecutionId,
+    p_limit: limit,
+  });
+
+  const denied = (errorMessage: string | null): NodeAttempt => ({
+    allowed: false,
+    nodeAttempts: 0,
+    graphAttempts: 0,
+    errorMessage,
+  });
+
+  if (error) return denied(error.message);
+
+  const row = (data as Record<string, unknown>[] | null)?.[0];
+  if (!row) return denied("claim_node_attempt returned no row");
+
+  // The RPC returns allowed=false with a zero graph total only when it could
+  // not find the node — which is a broken invariant, not a loop.
+  if (row.allowed !== true && Number(row.graph_attempts ?? 0) === 0) {
+    return denied(`Node execution ${nodeExecutionId} not found`);
+  }
+
+  return {
+    allowed: row.allowed === true,
+    nodeAttempts: Number(row.node_attempts ?? 0),
+    graphAttempts: Number(row.graph_attempts ?? 0),
+    errorMessage: null,
+  };
+}
+
 async function markFailed(db: Db, graphId: string, message: string): Promise<RunResult> {
   await db
     .from("agent_graph_executions")
@@ -539,6 +611,49 @@ async function executePending(
     };
   };
 
+  /**
+   * Ends the run because it kept re-entering nodes instead of finishing.
+   *
+   * The ledger row carries the graph total, the node the run stopped at, and
+   * that node's own attempt count. The total says a run is looping; the
+   * per-node counts on `agent_node_executions` say which step is doing it, and
+   * they survive the halt so the trace can be read afterwards.
+   */
+  const haltForLoop = async (
+    atNode: string,
+    nodeAttempts: number,
+    graphAttempts: number,
+  ): Promise<RunResult> => {
+    await settle();
+
+    await db
+      .from("agent_graph_executions")
+      .update({
+        status: "halted_loop_guard",
+        completed_at: new Date().toISOString(),
+      })
+      .eq("id", graphId);
+
+    await recordLedger(db, {
+      workspaceId,
+      graphExecutionId: graphId,
+      agentId: "FinOpsGovernor",
+      actionType: "loop_guard_halt",
+      payload: {
+        halted_before: atNode,
+        node_attempts: nodeAttempts,
+        graph_attempts: graphAttempts,
+        recursion_limit: loopLimit,
+      },
+    });
+
+    return {
+      graphExecutionId: graphId,
+      status: "halted_loop_guard",
+      message: `Runaway loop protection triggered before ${atNode}: this run has executed ${graphAttempts} node attempts, at or above its limit of ${loopLimit}. Completed steps are preserved. Raising max_agent_loop_recursion will let it continue, but a run at this ceiling is usually a step that cannot succeed rather than a plan that needs more room.`,
+    };
+  };
+
   /** Ends the run because the workspace is out of budget. */
   const haltForBudget = async (
     budget: BudgetState,
@@ -602,8 +717,11 @@ async function executePending(
   const nodes = (rows ?? []) as NodeRow[];
   const completed = nodes.filter((n) => n.node_status === "completed");
 
-  // Per-execution token ceiling, read once. Zero means unset.
-  const tokenCeiling = (await readBudget(db, workspaceId))?.maxTokensPerExecution ?? 0;
+  // The two per-execution ceilings, read once together. Zero means unset for
+  // both, matching how a budget cap of 0 means unset.
+  const controls = await readBudget(db, workspaceId);
+  const tokenCeiling = controls?.maxTokensPerExecution ?? 0;
+  const loopLimit = controls?.maxAgentLoopRecursion ?? 0;
 
   // Loaded once for the whole graph rather than per node: the registry is
   // small, and a tool appearing or vanishing midway through a run would make
@@ -639,6 +757,40 @@ async function executePending(
 
       if (tokenCeiling > 0 && totalTokens >= tokenCeiling) {
         return await haltForTokens(node.node_id);
+      }
+
+      // Recursion limit. Taken as a CLAIM rather than checked as a read,
+      // because the permission to run is consumed by running: a read followed
+      // by a write is a race, and the count this protects is what the run
+      // costs. The claim is refused without consuming anything, so an operator
+      // resuming a halted graph does not push it further past its own cap.
+      //
+      // This is the check the plan-size cap cannot make. A runaway here is not
+      // an oversized plan — it is a small one re-entered without end, once per
+      // HITL resolution, each cycle a fresh model call that the queue's own
+      // attempt counter never sees, because every resume dispatches a new job
+      // whose attempts start at zero.
+      //
+      // Last of the three checks, so a run that is going to halt for budget or
+      // tokens anyway does not spend an attempt on being told so.
+      const attempt = await claimNodeAttempt(db, node.id, loopLimit);
+      if (attempt.errorMessage) {
+        // Not a loop — we could not find out. Fail rather than halt, so the
+        // queue retries a transient cause instead of parking the run behind a
+        // ceiling it may be nowhere near.
+        await settle();
+        return await markFailed(
+          db,
+          graphId,
+          `Could not take an execution attempt for ${node.node_id}: ${attempt.errorMessage}`,
+        );
+      }
+      if (!attempt.allowed) {
+        return await haltForLoop(
+          node.node_id,
+          attempt.nodeAttempts,
+          attempt.graphAttempts,
+        );
       }
 
       const model = node.model_routing_used;
