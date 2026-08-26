@@ -49,3 +49,6 @@ next-env.d.ts
 
 # repomix whole-repo dump, regenerated on demand
 repomix-output.*
+
+# PDF renderings of the ai_docs blueprints; the .md versions are tracked
+ai_docs/*.pdf
