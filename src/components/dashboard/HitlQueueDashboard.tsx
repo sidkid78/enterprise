@@ -8,7 +8,11 @@ import {
   type ResolveState,
 } from "@/app/dashboard/actions";
 import type { PendingGate } from "@/lib/data/hitl";
-import { canResolveGates, type UserRole } from "@/lib/roles";
+import {
+  canResolveGates,
+  escalationTargets,
+  type UserRole,
+} from "@/lib/roles";
 
 import JsonView from "./JsonView";
 
@@ -40,6 +44,13 @@ export default function HitlQueueDashboard({
   const canResolve = selectedGate
     ? canResolveGates(viewerRole, selectedGate.requiredRole)
     : false;
+
+  // Tiers strictly above both the viewer and the current bar. Escalating to a
+  // level that is not higher would be a no-op the database rejects anyway, so
+  // it is never offered.
+  const escalateOptions = selectedGate
+    ? escalationTargets(viewerRole, selectedGate.requiredRole)
+    : [];
 
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
@@ -127,6 +138,11 @@ export default function HitlQueueDashboard({
                     <span className="font-mono text-slate-500">
                       Role:{" "}
                       <span className="text-slate-300">{gate.requiredRole}</span>
+                      {gate.escalated && (
+                        <span className="ml-2 rounded border border-violet-500/30 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-bold text-violet-300">
+                          ESCALATED
+                        </span>
+                      )}
                     </span>
                   </div>
                 </button>
@@ -277,13 +293,38 @@ export default function HitlQueueDashboard({
                 value={overrideOpen ? overrideText : ""}
               />
 
-              <ActionButton
-                decision="escalate"
-                disabled={pending || !canResolve}
-                className="border border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700"
-              >
-                Escalate
-              </ActionButton>
+              {/* Escalation carries a destination. Without one the action is
+                  ambiguous — "send this up" says nothing about who is now
+                  accountable — and the gate's required_role only ratchets
+                  upward, so the tier has to be chosen before it is raised. */}
+              {escalateOptions.length > 0 && (
+                <div className="flex items-center gap-2">
+                  <label htmlFor="escalateTo" className="sr-only">
+                    Escalate to
+                  </label>
+                  <select
+                    id="escalateTo"
+                    name="escalateTo"
+                    defaultValue={escalateOptions[0]}
+                    disabled={pending || !canResolve}
+                    className="rounded-md border border-slate-700 bg-slate-950 px-2 py-2 font-mono text-xs text-slate-300 disabled:opacity-50"
+                  >
+                    {escalateOptions.map((r) => (
+                      <option key={r} value={r}>
+                        {r}
+                      </option>
+                    ))}
+                  </select>
+
+                  <ActionButton
+                    decision="escalate"
+                    disabled={pending || !canResolve}
+                    className="border border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700"
+                  >
+                    Escalate
+                  </ActionButton>
+                </div>
+              )}
 
               <ActionButton
                 decision="reject"

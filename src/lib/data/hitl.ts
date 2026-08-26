@@ -2,6 +2,14 @@ import "server-only";
 
 import { createClient } from "@/lib/supabase/server";
 
+/**
+ * A gate is OPEN until somebody decides it. Escalation raises the rank needed
+ * to decide; it does not answer the question, so an escalated gate belongs in
+ * the queue — filtering to `pending` alone made an escalated gate invisible to
+ * the very people it had just been handed to.
+ */
+const OPEN_STATUSES = ["pending", "escalated"];
+
 import type { UserRole } from "@/lib/roles";
 
 export type ReasoningSummary = {
@@ -17,6 +25,12 @@ export type PendingGate = {
   triggerReason: string;
   confidenceScore: number | null;
   requiredRole: UserRole;
+  /**
+   * True once a reviewer has handed this gate upward. The gate is still open —
+   * this only says the bar in `requiredRole` was raised by a person rather than
+   * set by the trigger evaluator.
+   */
+  escalated: boolean;
   createdAt: string;
   reasoningSummary: ReasoningSummary;
   inputPayload: Record<string, unknown>;
@@ -70,10 +84,11 @@ export async function getPendingGates(
        reasoning_log_summary,
        input_payload,
        output_payload,
+       status,
        agent_node_executions ( agent_role )`,
     )
     .eq("workspace_id", workspaceId)
-    .eq("status", "pending")
+    .in("status", OPEN_STATUSES)
     .order("created_at", { ascending: false })
     .limit(50);
 
@@ -87,6 +102,7 @@ export async function getPendingGates(
     trigger_reason: string;
     confidence_score: number | null;
     required_role: UserRole;
+    status: string;
     created_at: string;
     reasoning_log_summary: unknown;
     input_payload: Record<string, unknown> | null;
@@ -106,6 +122,7 @@ export async function getPendingGates(
     triggerReason: row.trigger_reason,
     confidenceScore: row.confidence_score,
     requiredRole: row.required_role,
+    escalated: row.status === "escalated",
     createdAt: row.created_at,
     reasoningSummary: toReasoningSummary(row.reasoning_log_summary),
     inputPayload: row.input_payload ?? {},
@@ -120,7 +137,7 @@ export async function countPendingGates(workspaceId: string): Promise<number> {
     .from("hitl_approval_gates")
     .select("id", { count: "exact", head: true })
     .eq("workspace_id", workspaceId)
-    .eq("status", "pending");
+    .in("status", OPEN_STATUSES);
 
   if (error) {
     throw new Error(`Failed to count HITL gates: ${error.message}`);
