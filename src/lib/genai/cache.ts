@@ -21,6 +21,15 @@ export type CacheHit = {
   responsePayload: Record<string, unknown>;
   modelUsed: string;
   similarity: number;
+  /**
+   * What producing this answer actually cost, on the miss that created it.
+   *
+   * Null for entries written before the column existed. That is deliberately
+   * not zero: "we never recorded it" and "it was free" are different claims,
+   * and only the second would justify reporting a saving of $0.00.
+   */
+  producedCostUsd: number | null;
+  producedTokens: number | null;
 };
 
 /**
@@ -59,15 +68,25 @@ export async function lookupCache(
       response_payload: Record<string, unknown>;
       model_used: string;
       similarity: number;
+      prompt_tokens: number | null;
+      completion_tokens: number | null;
+      cost_usd: number | string | null;
     };
 
     await db.rpc("record_cache_hit", { p_cache_id: row.id });
+
+    const tokens =
+      row.prompt_tokens === null && row.completion_tokens === null
+        ? null
+        : (row.prompt_tokens ?? 0) + (row.completion_tokens ?? 0);
 
     return {
       id: row.id,
       responsePayload: row.response_payload,
       modelUsed: row.model_used,
       similarity: row.similarity,
+      producedCostUsd: row.cost_usd === null ? null : Number(row.cost_usd),
+      producedTokens: tokens,
     };
   } catch {
     // A cache failure must never fail the run — worst case is a cache miss and
@@ -91,6 +110,13 @@ export async function storeCache(
     modelUsed: string;
     graphExecutionId: string;
     ttlHours?: number;
+    /**
+     * What this call cost. Recorded so a later hit can report a MEASURED
+     * saving rather than a counterfactual — see migration ...27.
+     */
+    promptTokens?: number;
+    completionTokens?: number;
+    costUsd?: number;
   },
 ): Promise<void> {
   try {
@@ -107,6 +133,9 @@ export async function storeCache(
       model_used: params.modelUsed,
       graph_execution_id: params.graphExecutionId,
       expires_at: expiresAt,
+      prompt_tokens: params.promptTokens ?? null,
+      completion_tokens: params.completionTokens ?? null,
+      cost_usd: params.costUsd ?? null,
     });
   } catch {
     // Non-fatal for the same reason as lookup.

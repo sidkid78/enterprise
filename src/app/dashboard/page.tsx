@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import AccessControlPanel from "@/components/dashboard/AccessControlPanel";
 import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercialization";
+import FinopsPanel from "@/components/dashboard/FinopsPanel";
 import GovernanceControlPlane from "@/components/dashboard/GovernanceControlPlane";
 import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
 import McpToolRegistry from "@/components/dashboard/McpToolRegistry";
@@ -39,7 +40,7 @@ import {
   verifyLedgerChain,
   LEDGER_ROLES,
 } from "@/lib/data/governance";
-import { getBudgetStatus } from "@/lib/data/finops";
+import { getBudgetStatus, getFinopsSummary } from "@/lib/data/finops";
 import { getMcpServers, getMcpTools } from "@/lib/data/mcp";
 import {
   countDeadLetters,
@@ -305,6 +306,13 @@ export default async function EnterpriseDashboardPage({
         {tab === "bio" && (
           <div className="space-y-6">
             <BioRoiCommercialization workspaceName={active.name} roi={roi} />
+            {/*
+              FinOps sits on this tab rather than getting its own: gross margin
+              is deflected cost minus compute cost, and compute cost is exactly
+              what the cascade and the cache are defending. Splitting them
+              across tabs would separate a number from its explanation.
+            */}
+            <FinopsPanel finops={await getFinopsSummary(active.id)} />
             <SlaBillingPanel credit={await getSlaCredit(active.id)} />
             <BioAttributionTab workspaceId={active.id} viewerRole={active.role} />
           </div>

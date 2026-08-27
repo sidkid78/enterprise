@@ -406,3 +406,19 @@ What was missing was not *that* a step ran — the ledger says so, `input_payloa
 - `ageHours` is computed in the data layer from a single server-side clock read, not during render. Same reason `QueueHealth` carries `observedAt`: the dashboard only changes on navigation, so a live clock ages rows frozen at page load, and React's compiler lint rejects the impure call anyway.
 - **There is deliberately no hard expiry tied to provider retention.** An earlier draft auto-expired gates once the Interactions API could no longer be resumed from. It was dropped because that retention period is not documented anywhere — see the Gemini API note above on the "55 days" correction.
 - Verified as `set role authenticated` across six outcomes: `forbidden` (business_user on an `ai_administrator` gate), `not_overdue`, `expired`, `not_open`, `not_found`, and the overdue count falling 2 → 1. Gate, node and run all reached `timed_out` / `failed` / `failed`.
+
+## FinOps observability
+
+`workspace_finops_summary` in migration `…27`, `getFinopsSummary` in `src/lib/data/finops.ts`, `FinopsPanel` on the BIO tab.
+
+Four cost defences were built — cascade, semantic cache, budget controls, loop guard — and none was observable. The dashboard had a budget bar and a per-run spend figure; nothing said how much work the cache absorbed or how the tier mix fell out. A platform whose pitch is margin protection could not show its own.
+
+- **`ai_docs` → FinOps Engine → `semantic-cache.pdf` specifies the missing half**: on a hit the system "increments the cache entry's `hit_count`, and **logs the computed token savings** in `finops_token_logs`". We did the first and not the second.
+- **A saving here is a measurement, never a counterfactual.** "What this call would have cost" is unknowable — the same fabrication the runtime is banned from committing when it scores its own ROI. So `semantic_cache` records what producing the answer *actually* cost on the miss that created it, and a hit reports that recorded number. Verified end to end: run 1 paid $0.000480 for a node, run 2 hit the cache and logged `avoided_cost_usd = 0.000480`, `avoided_tokens = 471` — the same figures, because it is the same call.
+- **Savings live in their own columns and are never summed into spend.** `estimated_cost_usd` feeds `run_spend_summary`, `record_spend` and the budget gate, so an avoided cost booked there would inflate real spend and could halt a workspace for money it did not spend.
+- **`cost_usd` on a cache entry is nullable, and null is not zero.** Entries predating the column have no recorded cost: "we never measured it" and "it was free" are different claims, and only the second would justify reporting a $0.00 saving. Hence `cache_hits` and `cache_hits_priced` are separate figures and the panel names the gap rather than hiding it.
+- **Nothing forecasts.** No projected spend, no savings rate, no annualised figure — those are forecasts, and this dashboard does not put forecasts beside measurements.
+- **A node that escalates is never cached.** `storeCache` runs only after a node commits, so an output no human approved cannot be served to a later run. Worth knowing when testing: a prompt the critic flags will never populate the cache.
+- The panel sits on the BIO tab rather than getting its own: gross margin is deflected cost minus compute cost, and compute cost is exactly what the cascade and cache defend.
+
+**Documented divergences from `semantic-cache.pdf`:** the similarity threshold is **0.97, not the blueprint's 0.92** (at 0.92 sibling nodes in one run matched each other and one node's output was served for four distinct steps — see `cache.ts`); the embedding model is `gemini-embedding-001` at 768 dimensions, not `text-embedding-004`; and the TTL is 24h rather than 72h.

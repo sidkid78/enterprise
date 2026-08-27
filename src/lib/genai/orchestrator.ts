@@ -1285,6 +1285,12 @@ async function executePending(
         cached_tokens: usage.cachedTokens,
         estimated_cost_usd: cost,
         routing_tier: routingTier,
+        // Recorded only on a hit, and never in estimated_cost_usd: that column
+        // is summed by run_spend_summary, record_spend and the budget gate, so
+        // an avoided cost booked there would inflate real spend and could halt
+        // a workspace for money it did not spend.
+        avoided_cost_usd: cached?.producedCostUsd ?? 0,
+        avoided_tokens: cached?.producedTokens ?? 0,
       });
 
       // === GATE 3: critic review ======================================
@@ -1440,6 +1446,13 @@ async function executePending(
           responsePayload: output as unknown as Record<string, unknown>,
           modelUsed: model,
           graphExecutionId: graphId,
+          // What this answer cost to produce. A later hit reports exactly this
+          // number as the cost it avoided, which makes the saving a
+          // measurement of a real past call rather than a guess about a
+          // hypothetical one.
+          promptTokens: usage.inputTokens,
+          completionTokens: usage.outputTokens,
+          costUsd: cost,
         });
       }
 
