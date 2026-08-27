@@ -20,6 +20,16 @@ export async function getUserClaims() {
 
 /**
  * Every workspace the signed-in user belongs to, with their role in each.
+ *
+ * Redeems any pending invitations first. The signup trigger covers people who
+ * did not have an account yet; this covers everyone who did, which is the
+ * ordinary case — an administrator invites a colleague who registered months
+ * ago, no row in auth.users changes, and nothing would otherwise ever fire.
+ *
+ * Done on every load rather than once per session because there is no session
+ * hook to hang it on, and getting it wrong is invisible: the invitee sees an
+ * empty dashboard and no reason why. It is one indexed delete against a table
+ * that is empty in the common case.
  */
 export async function getUserWorkspaces(): Promise<WorkspaceSummary[]> {
   const supabase = await createClient();
@@ -27,6 +37,14 @@ export async function getUserWorkspaces(): Promise<WorkspaceSummary[]> {
   const claims = await getUserClaims();
   const userId = claims?.sub;
   if (!userId) return [];
+
+  // A failure here must not cost the user their dashboard — they may already
+  // be a member of several workspaces, and an unredeemed invitation is a
+  // missing row, not a broken page.
+  const { error: redeemError } = await supabase.rpc("redeem_my_invitations");
+  if (redeemError) {
+    console.error(`Could not redeem invitations: ${redeemError.message}`);
+  }
 
   const { data, error } = await supabase
     .from("workspace_members")

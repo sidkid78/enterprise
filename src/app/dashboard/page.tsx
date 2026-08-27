@@ -1,5 +1,6 @@
 import Link from "next/link";
 
+import AccessControlPanel from "@/components/dashboard/AccessControlPanel";
 import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercialization";
 import GovernanceControlPlane from "@/components/dashboard/GovernanceControlPlane";
 import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
@@ -39,8 +40,10 @@ import {
   getQueueHealth,
   getWorkerFleet,
 } from "@/lib/data/queue";
+import { getInvitations, getMembers } from "@/lib/data/members";
 import { getTrainingModules } from "@/lib/data/workforce";
-import { resolveActiveWorkspace } from "@/lib/data/workspaces";
+import { getUserClaims, resolveActiveWorkspace } from "@/lib/data/workspaces";
+import { ROLE_POWER, type UserRole } from "@/lib/roles";
 
 const TABS = [
   { key: "hitl", label: "HITL Decision Queue" },
@@ -50,6 +53,7 @@ const TABS = [
   { key: "governance", label: "Governance & Audit" },
   { key: "upskilling", label: "Workforce Enablement & SOPs" },
   { key: "bio", label: "BIO ROI & SLA Billing" },
+  { key: "access", label: "Access Control" },
 ] as const;
 
 type TabKey = (typeof TABS)[number]["key"];
@@ -271,6 +275,9 @@ export default async function EnterpriseDashboardPage({
         {tab === "governance" && (
           <GovernanceTab workspaceId={active.id} viewerRole={active.role} />
         )}
+        {tab === "access" && (
+          <AccessTab workspaceId={active.id} viewerRole={active.role} />
+        )}
         {tab === "upskilling" && (
           <UpskillingTab workspaceId={active.id} workspaceName={active.name} viewerRole={active.role} />
         )}
@@ -292,6 +299,45 @@ export default async function EnterpriseDashboardPage({
  * return nothing to anyway — asking and getting zero rows would render as "no
  * entries recorded", which is a different and misleading claim.
  */
+/**
+ * Membership and invitations.
+ *
+ * The roster is readable by every member — knowing who may act in a workspace,
+ * and at what rank, is not privileged inside that workspace. Only
+ * `ai_administrator` and above may change it, which the RLS policies enforce;
+ * `canManage` only decides whether to render controls that would otherwise
+ * fail.
+ */
+async function AccessTab({
+  workspaceId,
+  viewerRole,
+}: {
+  workspaceId: string;
+  viewerRole: UserRole;
+}) {
+  const claims = await getUserClaims();
+  const viewerId = String(claims?.sub ?? "");
+  const canManage = ROLE_POWER[viewerRole] >= ROLE_POWER.ai_administrator;
+
+  const [members, invitations] = await Promise.all([
+    getMembers(workspaceId),
+    // Returns [] rather than throwing when the policy admits nothing, so an
+    // ordinary member reading the roster is not an error page.
+    canManage ? getInvitations(workspaceId) : Promise.resolve([]),
+  ]);
+
+  return (
+    <AccessControlPanel
+      workspaceId={workspaceId}
+      viewerId={viewerId}
+      viewerRole={viewerRole}
+      members={members}
+      invitations={invitations}
+      canManage={canManage}
+    />
+  );
+}
+
 async function GovernanceTab({
   workspaceId,
   viewerRole,
