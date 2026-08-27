@@ -2,6 +2,7 @@ import Link from "next/link";
 
 import AccessControlPanel from "@/components/dashboard/AccessControlPanel";
 import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercialization";
+import DecisionHistory from "@/components/dashboard/DecisionHistory";
 import FinopsPanel from "@/components/dashboard/FinopsPanel";
 import GovernanceControlPlane from "@/components/dashboard/GovernanceControlPlane";
 import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
@@ -27,6 +28,7 @@ import { countActiveExecutions, getRecentExecutions } from "@/lib/data/dag";
 import {
   countOverdueGates,
   countPendingGates,
+  getDecisionHistory,
   getPendingGates,
 } from "@/lib/data/hitl";
 import {
@@ -47,7 +49,11 @@ import {
   getQueueHealth,
   getWorkerFleet,
 } from "@/lib/data/queue";
-import { getInvitations, getMembers } from "@/lib/data/members";
+import {
+  getInvitations,
+  getMemberDirectory,
+  getMembers,
+} from "@/lib/data/members";
 import { getAgentMessages } from "@/lib/data/messages";
 import { getTrainingModules } from "@/lib/data/workforce";
 import { getUserClaims, resolveActiveWorkspace } from "@/lib/data/workspaces";
@@ -401,7 +407,12 @@ async function GovernanceTab({
 }) {
   const canReadLedger = LEDGER_ROLES.includes(viewerRole);
 
-  const [events, ledger, verification, queue, workers] = await Promise.all([
+  // Identities first: the decision log needs the directory to name a resolver,
+  // and rendering a raw uuid would be worse than not rendering the column.
+  const directory = await getMemberDirectory(workspaceId);
+
+  const [events, ledger, verification, queue, workers, decisions] =
+    await Promise.all([
     getGuardrailEvents(workspaceId),
     canReadLedger ? getLedgerEntries(workspaceId) : Promise.resolve([]),
     canReadLedger ? verifyLedgerChain(workspaceId) : Promise.resolve(null),
@@ -412,10 +423,17 @@ async function GovernanceTab({
     // Fleet-wide, not workspace-scoped: one worker drains every tenant, so
     // "is anything running?" has the same answer for all of them.
     getWorkerFleet(),
+    getDecisionHistory(workspaceId, directory),
   ]);
 
   return (
     <>
+      {/*
+        Above the guardrail feed: the human decisions are the part of the audit
+        trail a compliance reader comes for, and the automated gates are the
+        supporting evidence.
+      */}
+      <DecisionHistory decisions={decisions} />
       <QueueHealthPanel
         workspaceId={workspaceId}
         health={queue}

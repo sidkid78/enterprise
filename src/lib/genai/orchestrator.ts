@@ -2084,7 +2084,13 @@ export async function resumeGraph(graphExecutionId: string): Promise<RunResult> 
 
   const { data: gate } = await db
     .from("hitl_approval_gates")
-    .select("id, status, node_execution_id, output_payload, human_feedback")
+    // resolved_by/resolved_at come along so the ledger can name the person.
+    // The worker runs as service_role and has no session, so identity cannot
+    // come from the caller — it comes from the gate row the reviewer wrote,
+    // which is also the only record that survives a queue hop.
+    .select(
+      "id, status, node_execution_id, output_payload, human_feedback, resolved_by, resolved_at, required_role",
+    )
     .eq("graph_execution_id", graphExecutionId)
     .order("created_at", { ascending: false })
     .limit(1)
@@ -2117,7 +2123,16 @@ export async function resumeGraph(graphExecutionId: string): Promise<RunResult> 
       nodeExecutionId: gate.node_execution_id,
       agentId: "HumanReviewer",
       actionType: "hitl_rejection",
-      payload: { gate_id: gate.id, feedback: gate.human_feedback ?? null },
+      payload: {
+        gate_id: gate.id,
+        feedback: gate.human_feedback ?? null,
+        // WHO. The blueprint's RBAC doc puts the operator's id in the chain,
+        // and without it the ledger's answer to "who rejected this run" is the
+        // constant string "HumanReviewer".
+        operator_id: gate.resolved_by ?? null,
+        resolved_at: gate.resolved_at ?? null,
+        required_role: gate.required_role ?? null,
+      },
     });
 
     return {
@@ -2216,7 +2231,16 @@ export async function resumeGraph(graphExecutionId: string): Promise<RunResult> 
     nodeExecutionId: gate.node_execution_id,
     agentId: "HumanReviewer",
     actionType: "hitl_approval",
-    payload: { gate_id: gate.id, feedback: gate.human_feedback ?? null },
+    payload: {
+      gate_id: gate.id,
+      feedback: gate.human_feedback ?? null,
+      operator_id: gate.resolved_by ?? null,
+      resolved_at: gate.resolved_at ?? null,
+      // The bar the gate actually carried when it was cleared. An escalated
+      // gate is resolved at a higher rank than it was raised at, and an
+      // auditor needs the rank that was satisfied, not today's value.
+      required_role: gate.required_role ?? null,
+    },
   });
 
   await db

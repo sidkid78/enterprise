@@ -195,3 +195,88 @@ export async function countOverdueGates(workspaceId: string): Promise<number> {
 
   return Number(data ?? 0);
 }
+
+/**
+ * One gate a person decided.
+ *
+ * `resolved_by` and `resolved_at` have been written since Phase 3 and read by
+ * nothing: a gate left the interface the instant it was resolved. For a
+ * governance product the decision log is the evidence the controls were
+ * actually exercised, so it is not a nice-to-have view.
+ */
+export type Decision = {
+  gateId: string;
+  graphExecutionId: string;
+  nodeId: string | null;
+  agentRole: string | null;
+  triggerReason: string;
+  requiredRole: UserRole;
+  status: string;
+  confidenceScore: number | null;
+  humanFeedback: string | null;
+  resolvedBy: string | null;
+  /** Email when the viewer may see it, else null — never a bare uuid. */
+  resolvedByEmail: string | null;
+  resolvedAt: string | null;
+  createdAt: string;
+  /** How long the gate waited before someone acted. */
+  waitSeconds: number;
+};
+
+/**
+ * Decisions on this workspace's gates, newest first.
+ *
+ * The RPC is SECURITY INVOKER and `hitl_select` filters by role, so a viewer
+ * sees the history of gates they could have opened — not a workspace-wide log
+ * that would leak the subject of gates above their rank.
+ */
+export async function getDecisionHistory(
+  workspaceId: string,
+  directory: Map<string, string>,
+): Promise<Decision[]> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase.rpc("workspace_decision_history", {
+    p_workspace_id: workspaceId,
+    p_limit: 50,
+  });
+
+  if (error) {
+    throw new Error(`Failed to load decision history: ${error.message}`);
+  }
+
+  type Row = {
+    gate_id: string;
+    graph_execution_id: string;
+    node_id: string | null;
+    agent_role: string | null;
+    trigger_reason: string;
+    required_role: UserRole;
+    status: string;
+    confidence_score: number | null;
+    human_feedback: string | null;
+    resolved_by: string | null;
+    resolved_at: string | null;
+    created_at: string;
+    wait_seconds: number | string;
+  };
+
+  return ((data ?? []) as Row[]).map((row) => ({
+    gateId: row.gate_id,
+    graphExecutionId: row.graph_execution_id,
+    nodeId: row.node_id,
+    agentRole: row.agent_role,
+    triggerReason: row.trigger_reason,
+    requiredRole: row.required_role,
+    status: row.status,
+    confidenceScore: row.confidence_score,
+    humanFeedback: row.human_feedback,
+    resolvedBy: row.resolved_by,
+    resolvedByEmail: row.resolved_by
+      ? (directory.get(row.resolved_by) ?? null)
+      : null,
+    resolvedAt: row.resolved_at,
+    createdAt: row.created_at,
+    waitSeconds: Number(row.wait_seconds ?? 0),
+  }));
+}
