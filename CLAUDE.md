@@ -103,6 +103,12 @@ Everything else in that document is already true here — verified against the l
 
 Membership answers **which tenant**; it never answers **what may this person do**. Keeping those separate is what the whole RBAC hierarchy rests on.
 
+**And both halves belong in the database, not only in Server Actions.** The same document places tenant isolation in RLS but authorization in the application layer, accepting that "if application logic gets messed up, your users might occasionally be able to click buttons they shouldn't". That reasoning assumes the Server Action is the only door. It is not — PostgREST exposes the table directly and `authenticated` holds `UPDATE` on `hitl_approval_gates`, so a role check that lives only in `app/dashboard/actions.ts` is a client-side check on a directly addressable server. Application logic does not have to break; it only has to be skipped.
+
+Demonstrated, then reverted: a real `business_user`, their own JWT, one `curl -X PATCH` at `/rest/v1/hitl_approval_gates`. Under our policies it returns `[]` and the gate stays `pending`. With the generator's policy installed on that one table it returns `{"status":"approved","required_role":"agent_operator"}` — a level-1 user approving a level-2 gate, no button clicked, `resolveGate` never invoked. The consequence is not cosmetic: the approval lands in `agent_audit_ledger`, hash-chained, and reads to an auditor as proof the control held.
+
+So RBAC is enforced twice on purpose — `hitl_resolve` plus the ratchet trigger in the database, and the same check in the Server Action for a usable error message rather than a silent zero-row update. The database is the authority; the Server Action is UX. Same reasoning as `verify_ledger_chain` recomputing hashes instead of reading a status column. Note this predates the current work: `hitl_resolve` has carried a role predicate since migration `…03`, and `…22` only made it a hierarchy instead of an exact match.
+
 Two tables are deliberately client-invisible: `semantic_cache` has RLS on with **no policies** (it stores verbatim prompts — highest PII risk), and `agent_audit_ledger` is append-only via trigger with hashes computed server-side. Tables also need explicit `GRANT`s — since 2026-04-28 new public tables are not auto-exposed to the Data API.
 
 Auth is email+password. `src/proxy.ts` (Next 16's rename of `middleware`) refreshes the session and gates `/dashboard`. It uses `getClaims()`, which validates the JWT — never substitute `getSession()` for authorization.
