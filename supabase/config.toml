@@ -223,7 +223,16 @@ enable_signup = true
 # addresses. If disabled, only the new email is required to confirm.
 double_confirm_changes = true
 # If enabled, users need to confirm their email address before signing in.
-enable_confirmations = false
+#
+# ON DELIBERATELY, including locally. Workspace invitations are redeemed against
+# a CONFIRMED address (migration ...23) — with this false, GoTrue stamps
+# email_confirmed_at at signup and that check passes vacuously, so the whole
+# protection is inert and untested. Developing against the weaker setting hides
+# the one failure it exists to prevent: whoever signs up claiming an invited
+# address first is handed the membership.
+#
+# Mail is caught locally by [local_smtp] on port 54324, not delivered.
+enable_confirmations = true
 # If enabled, users will need to reauthenticate or have logged in recently to change their password.
 secure_password_change = false
 # Controls the minimum amount of time that must pass before sending another signup confirmation or password reset email.
