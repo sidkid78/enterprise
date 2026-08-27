@@ -7,6 +7,7 @@ import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
 import McpToolRegistry from "@/components/dashboard/McpToolRegistry";
 import OutcomeAttribution from "@/components/dashboard/OutcomeAttribution";
 import QueueHealthPanel from "@/components/dashboard/QueueHealthPanel";
+import SlaBillingPanel from "@/components/dashboard/SlaBillingPanel";
 import SopWorkbench from "@/components/dashboard/SopWorkbench";
 import DagTraceVisualizer from "@/components/dashboard/DagTraceVisualizer";
 import HitlQueueDashboard from "@/components/dashboard/HitlQueueDashboard";
@@ -19,6 +20,7 @@ import {
   getBaselines,
   getOutcomes,
   getRoiSummary,
+  getSlaCredit,
 } from "@/lib/data/bio";
 import { countActiveExecutions, getRecentExecutions } from "@/lib/data/dag";
 import { countPendingGates, getPendingGates } from "@/lib/data/hitl";
@@ -284,6 +286,7 @@ export default async function EnterpriseDashboardPage({
         {tab === "bio" && (
           <div className="space-y-6">
             <BioRoiCommercialization workspaceName={active.name} roi={roi} />
+            <SlaBillingPanel credit={await getSlaCredit(active.id)} />
             <BioAttributionTab workspaceId={active.id} viewerRole={active.role} />
           </div>
         )}

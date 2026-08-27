@@ -319,3 +319,73 @@ export async function getAttributableRuns(
     attributedTo: claimed.get(row.id) ?? [],
   }));
 }
+
+/**
+ * What the current billing period owes the customer.
+ *
+ * Every figure is derived in SQL from recorded downtime intervals and the
+ * signed contract — see migration `…24`. Nothing is estimated and nothing is
+ * written: computing a credit is measurement, issuing one is a financial act,
+ * and the runtime does not perform financial acts on its own behalf. Same rule
+ * that keeps `bio_outcome_logs` free of self-scored ROI.
+ *
+ * The credit SCHEDULE is ours, not the blueprint's. `ai_docs` describes the
+ * subscription schema and says the breach log is "crucial for calculating
+ * billing credits", then specifies no tiers and no proration. So the bands live
+ * in `private.sla_credit_rate` where the dashboard and any future invoice read
+ * the same definition, and this comment is the note that they were designed
+ * rather than cited.
+ */
+export type SlaCredit = {
+  periodStart: string;
+  periodEnd: string;
+  /** How much of the period has actually elapsed, 0-1. Credits are prorated. */
+  elapsedFraction: number;
+  monthlyRecurringFeeUsd: number;
+  uptimeTarget: number;
+  uptimeActual: number | null;
+  downtimeSeconds: number;
+  incidentCount: number;
+  /** False when the period has no elapsed span to measure. */
+  measured: boolean;
+  /** 0, 0.10, 0.25 or 0.50 of the prorated fee. */
+  creditRate: number;
+  creditUsd: number;
+};
+
+/**
+ * Returns null when the workspace has no active subscription.
+ *
+ * Not an error and not a zero: a workspace nobody is billing owes no credit,
+ * and rendering "$0.00 owed" would assert a contract that does not exist.
+ */
+export async function getSlaCredit(
+  workspaceId: string,
+): Promise<SlaCredit | null> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase.rpc("workspace_sla_credit", {
+    p_workspace_id: workspaceId,
+  });
+
+  if (error) {
+    throw new Error(`Failed to compute SLA credit: ${error.message}`);
+  }
+
+  const row = (data as Record<string, unknown>[] | null)?.[0];
+  if (!row) return null;
+
+  return {
+    periodStart: String(row.period_start),
+    periodEnd: String(row.period_end),
+    elapsedFraction: Number(row.elapsed_fraction ?? 0),
+    monthlyRecurringFeeUsd: Number(row.monthly_recurring_fee ?? 0),
+    uptimeTarget: Number(row.uptime_target ?? 0),
+    uptimeActual: row.uptime_actual === null ? null : Number(row.uptime_actual),
+    downtimeSeconds: Number(row.downtime_seconds ?? 0),
+    incidentCount: Number(row.incident_count ?? 0),
+    measured: row.measured === true,
+    creditRate: Number(row.credit_rate ?? 0),
+    creditUsd: Number(row.credit_usd ?? 0),
+  };
+}
