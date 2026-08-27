@@ -3,7 +3,9 @@
 import { useActionState, useState } from "react";
 
 import {
+  expireGate,
   resolveGate,
+  type ExpireState,
   type ResolveDecision,
   type ResolveState,
 } from "@/app/dashboard/actions";
@@ -17,6 +19,64 @@ import {
 import JsonView from "./JsonView";
 
 const initialState: ResolveState = { error: null, ok: false };
+const expireInitialState: ExpireState = { error: null, message: null };
+
+/**
+ * The expire control, shown only on a gate that is actually overdue.
+ *
+ * Its own form and its own action state, deliberately kept out of the resolve
+ * form: expiring is not a decision about the work, and letting it share the
+ * feedback box and the approve/reject row would invite it being pressed as a
+ * fourth verdict. The database refuses a gate that is not overdue anyway.
+ */
+function ExpireGate({ gateId, ageHours }: { gateId: string; ageHours: number }) {
+  const [state, formAction, pending] = useActionState(
+    expireGate,
+    expireInitialState,
+  );
+
+  return (
+    <form action={formAction} className="mt-4 rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+      <p className="text-xs text-amber-300">
+        Waiting {Math.floor(ageHours)} hours with no decision.
+      </p>
+      <p className="mt-1 text-[11px] text-slate-400">
+        Expiring stops the run and commits nothing. It is recorded as your
+        decision that nobody is coming — not as an approval or a rejection.
+      </p>
+
+      <input type="hidden" name="gateId" value={gateId} />
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <label htmlFor={`expire-reason-${gateId}`} className="sr-only">
+          Reason
+        </label>
+        <input
+          id={`expire-reason-${gateId}`}
+          name="reason"
+          placeholder="Why is nobody answering? (optional)"
+          className="min-w-[220px] flex-1 rounded-md border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs text-slate-200 placeholder:text-slate-600"
+        />
+        <button
+          type="submit"
+          disabled={pending}
+          className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-[11px] font-bold text-amber-400 hover:bg-amber-500/20 disabled:opacity-50"
+        >
+          {pending ? "Expiring…" : "Expire gate"}
+        </button>
+      </div>
+
+      {(state.error || state.message) && (
+        <p
+          role={state.error ? "alert" : "status"}
+          className={`mt-2 text-[11px] ${state.error ? "text-rose-400" : "text-emerald-400"}`}
+        >
+          {state.error ?? state.message}
+        </p>
+      )}
+    </form>
+  );
+}
 
 export default function HitlQueueDashboard({
   gates,
@@ -141,6 +201,16 @@ export default function HitlQueueDashboard({
                       {gate.escalated && (
                         <span className="ml-2 rounded border border-violet-500/30 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-bold text-violet-300">
                           ESCALATED
+                        </span>
+                      )}
+                      {gate.overdue && (
+                        /*
+                          The age, not just a flag. "Overdue" alone tells a
+                          reviewer to hurry; the number tells them whether this
+                          slipped by an hour or was abandoned last week.
+                        */
+                        <span className="ml-2 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-bold text-amber-400">
+                          {Math.floor(gate.ageHours)}H UNANSWERED
                         </span>
                       )}
                     </span>
@@ -276,6 +346,13 @@ export default function HitlQueueDashboard({
                 role. Your role is{" "}
                 <span className="font-mono text-slate-300">{viewerRole}</span>.
               </p>
+            )}
+
+            {selectedGate.overdue && canResolve && (
+              <ExpireGate
+                gateId={selectedGate.id}
+                ageHours={selectedGate.ageHours}
+              />
             )}
 
             <form

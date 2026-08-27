@@ -23,7 +23,11 @@ import {
   getSlaCredit,
 } from "@/lib/data/bio";
 import { countActiveExecutions, getRecentExecutions } from "@/lib/data/dag";
-import { countPendingGates, getPendingGates } from "@/lib/data/hitl";
+import {
+  countOverdueGates,
+  countPendingGates,
+  getPendingGates,
+} from "@/lib/data/hitl";
 import {
   getKnowledgeBases,
   getKnowledgeDocuments,
@@ -79,7 +83,14 @@ export default async function EnterpriseDashboardPage({
   const { active, all } = await resolveActiveWorkspace(requestedWorkspace);
 
   // Header counters are always shown, so they load regardless of active tab.
-  const [pendingHitlCount, activeDagRuns, roi, budget, deadLetterCount] =
+  const [
+    pendingHitlCount,
+    activeDagRuns,
+    roi,
+    budget,
+    deadLetterCount,
+    overdueGateCount,
+  ] =
     await Promise.all([
       countPendingGates(active.id),
       countActiveExecutions(active.id),
@@ -89,6 +100,10 @@ export default async function EnterpriseDashboardPage({
       // invisible otherwise, which is the whole failure this counter exists to
       // prevent. An operator should not have to go looking for it.
       countDeadLetters(active.id),
+      // Also on every tab. A gate nobody answers is the quietest failure in the
+      // product: it holds no worker, blocks no queue and raises no error, while
+      // the run behind it stays frozen. One had been waiting 111 hours.
+      countOverdueGates(active.id),
     ]);
 
   const tabHref = (key: TabKey) =>
@@ -230,6 +245,11 @@ export default async function EnterpriseDashboardPage({
                   {key === "hitl" && pendingHitlCount > 0 && (
                     <span className="ml-2 rounded-full border border-amber-500/40 bg-amber-500/20 px-2 py-0.5 text-xs font-bold text-amber-400">
                       {pendingHitlCount}
+                    </span>
+                  )}
+                  {key === "hitl" && overdueGateCount > 0 && (
+                    <span className="ml-1 rounded-full border border-rose-500/40 bg-rose-500/20 px-2 py-0.5 text-xs font-bold text-rose-400">
+                      {overdueGateCount} overdue
                     </span>
                   )}
                   {key === "governance" && deadLetterCount > 0 && (

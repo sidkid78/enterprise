@@ -10,6 +10,13 @@ import { createClient } from "@/lib/supabase/server";
  */
 const OPEN_STATUSES = ["pending", "escalated"];
 
+/**
+ * Mirrors `private.hitl_review_sla_hours()`. A UI affordance only — the
+ * database re-checks it, and `expire_hitl_gate` refuses a gate that is not
+ * actually overdue.
+ */
+export const REVIEW_SLA_HOURS = 24;
+
 import type { UserRole } from "@/lib/roles";
 
 export type ReasoningSummary = {
@@ -32,6 +39,17 @@ export type PendingGate = {
    */
   escalated: boolean;
   createdAt: string;
+  /**
+   * Hours this gate has been waiting, measured server-side.
+   *
+   * Not derived in the component: the dashboard is a server component that
+   * changes only on navigation, so a `Date.now()` during render would age a
+   * gate against rows frozen at page load. Same reason `QueueHealth` carries
+   * `observedAt`, and React's compiler lint rejects the impure call anyway.
+   */
+  ageHours: number;
+  /** Past the review SLA — nobody has looked at this in time. */
+  overdue: boolean;
   reasoningSummary: ReasoningSummary;
   inputPayload: Record<string, unknown>;
   outputPayload: Record<string, unknown>;
@@ -115,7 +133,12 @@ export async function getPendingGates(
       | null;
   };
 
-  return ((data ?? []) as unknown as Row[]).map((row) => ({
+  const observedAt = Date.now();
+
+  return ((data ?? []) as unknown as Row[]).map((row) => {
+    const ageHours =
+      (observedAt - new Date(row.created_at).getTime()) / 3_600_000;
+    return {
     id: row.id,
     graphExecutionId: row.graph_execution_id,
     agentRole: firstOf(row.agent_node_executions)?.agent_role ?? "UnknownAgent",
@@ -127,7 +150,10 @@ export async function getPendingGates(
     reasoningSummary: toReasoningSummary(row.reasoning_log_summary),
     inputPayload: row.input_payload ?? {},
     outputPayload: row.output_payload ?? {},
-  }));
+    ageHours,
+    overdue: ageHours >= REVIEW_SLA_HOURS,
+    };
+  });
 }
 
 export async function countPendingGates(workspaceId: string): Promise<number> {
@@ -144,4 +170,28 @@ export async function countPendingGates(workspaceId: string): Promise<number> {
   }
 
   return count ?? 0;
+}
+
+/**
+ * Gates still open past the review SLA.
+ *
+ * Counted in SQL rather than filtered from `getPendingGates`, because the badge
+ * is rendered on every tab while the gate list is fetched only on the HITL one.
+ * The RPC is SECURITY INVOKER and `hitl_select` already restricts gates by
+ * role, so this is the count of what THIS viewer is responsible for — not the
+ * workspace total. An operator being nagged about an administrator's gate they
+ * cannot open would be noise.
+ */
+export async function countOverdueGates(workspaceId: string): Promise<number> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase.rpc("overdue_gate_count", {
+    p_workspace_id: workspaceId,
+  });
+
+  // A missing badge is better than a dead dashboard. The gates themselves are
+  // still listed with their ages on the HITL tab either way.
+  if (error) return 0;
+
+  return Number(data ?? 0);
 }

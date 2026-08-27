@@ -126,7 +126,7 @@ The model ids in the mock DAG data are real and current; the cascade `gemini-3.5
 Points where the API shapes this project's design:
 
 - Multi-turn state is `previous_interaction_id`, and long work is `background: true` + polling `interactions.get(id)`. The `requires_action` status is what a HITL gate maps onto; persist the interaction id on the gate record to resume after sign-off.
-- Both of those require `store: true` (the default), so interaction inputs are retained server-side — PII masking must happen *before* the call, not as a post-filter.
+- Both of those require `store: true` (the default), so interaction inputs are retained server-side — PII masking must happen *before* the call, not as a post-filter. **How long they are retained is not documented.** This file previously said 55 days; that number is from `logs-policy` — AI Studio's configurable 7/14/28/55-day *prompt-logging* window — which is a different subsystem from Interactions API state. The ZDR guide says only that state storage is on by default and `store: false` opts out, and the API offers an explicit DELETE. The masking conclusion is unchanged; do not build a deadline on a TTL nobody has stated.
 - Responses are a typed `steps[]` timeline (`model_output`, `thought`, `function_call`/`function_result`, …) that maps onto the `DagNode` trace the dashboard renders. Derive trace nodes from `steps` rather than inventing a parallel structure. Prefer the `output_text` helper over indexing `steps`.
 - `temperature`/`top_p`/`top_k` are deprecated; use `thinking_level`, not `thinking_budget`.
 
@@ -385,3 +385,18 @@ What was missing was not *that* a step ran — the ledger says so, `input_payloa
 - **`recordMessage` never throws and never blocks a run.** A missing transcript row is a gap in the record; a failed run because the record could not be written is a gap in the work — and the ledger already carries the fact that the step happened.
 - Truncation at 12,000 chars is **stated on the row**, not silently applied: a reader must be able to tell a short prompt from a clipped one.
 - **Old runs have no transcript and it is not reconstructed.** A rebuilt record of what an agent was told would be a guess presented as evidence.
+
+## HITL review SLA
+
+`private.hitl_review_sla_hours()` (24), `overdue_gate_count`, `expire_hitl_gate` in migration `…26`; `countOverdueGates` / `ageHours` in `src/lib/data/hitl.ts`; `expireGate` in `actions.ts`; badge and expire control in `HitlQueueDashboard`.
+
+`hitl_status_enum` has carried **`timed_out`** since migration `…03` with nothing writing it, and the blueprint declares the same value without ever saying what produces it. So a gate nobody answered stayed `pending` forever: holding no worker, blocking no queue, raising no error, with the run behind it frozen and nothing anywhere saying so. Found live — two gates at 107 and 111 hours.
+
+- **Expiry is an operator action, never a background sweep.** A gate exists because a decision needs a human; closing it by clock is the platform deciding by inaction, which is the failure the gate was raised to prevent — and it would terminate a run for a reason nobody reviewed. What the platform does honestly is *measure* the wait and say so loudly. Same split as the SLA credit: computing is measurement, acting is an act.
+- **`expire_hitl_gate` refuses a gate that is not actually overdue** (`not_overdue`). Without that check "expire" is a second reject button with a friendlier name, and the audit trail stops distinguishing "we decided against this" from "nobody ever looked".
+- **It fails closed**: the node fails, the graph fails, nothing the agent proposed is committed. The only safe direction for a decision that was never made.
+- **It is SECURITY DEFINER with the authorization written out**, uniquely among the gate paths. Closing a gate must update `agent_node_executions` and `agent_graph_executions`, and `authenticated` has no UPDATE on either — nor should it, since that would let any member PATCH a run's status through PostgREST. An INVOKER draft died with `permission denied for table agent_node_executions` the moment it was run as `authenticated`. The explicit check is the same predicate `hitl_resolve` uses, `has_role_power(workspace_id, required_role)`: whoever could have answered the gate is who may declare that nobody did.
+- **`overdue_gate_count` is INVOKER**, so it counts only gates the caller could open — `hitl_select` already filters by role. An operator nagged about an administrator's gate they cannot act on would be noise.
+- `ageHours` is computed in the data layer from a single server-side clock read, not during render. Same reason `QueueHealth` carries `observedAt`: the dashboard only changes on navigation, so a live clock ages rows frozen at page load, and React's compiler lint rejects the impure call anyway.
+- **There is deliberately no hard expiry tied to provider retention.** An earlier draft auto-expired gates once the Interactions API could no longer be resumed from. It was dropped because that retention period is not documented anywhere — see the Gemini API note above on the "55 days" correction.
+- Verified as `set role authenticated` across six outcomes: `forbidden` (business_user on an `ai_administrator` gate), `not_overdue`, `expired`, `not_open`, `not_found`, and the overdue count falling 2 → 1. Gate, node and run all reached `timed_out` / `failed` / `failed`.

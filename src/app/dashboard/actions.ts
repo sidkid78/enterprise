@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 
 import { createClient } from "@/lib/supabase/server";
 import { ROLE_POWER, type UserRole } from "@/lib/roles";
+import { REVIEW_SLA_HOURS } from "@/lib/data/hitl";
 
 export type ResolveDecision = "approve" | "reject" | "escalate";
 
@@ -207,4 +208,56 @@ export async function resolveGate(
 
   revalidatePath("/dashboard");
   return { ok: true, error: null, message: resumeMessage };
+}
+
+export type ExpireState = { error: string | null; message: string | null };
+
+/**
+ * Closes a gate nobody answered within the review window.
+ *
+ * A deliberate act by a person, never a background sweep. A gate exists because
+ * a decision needs a human; letting the platform close it by clock would be the
+ * platform deciding by inaction, which is the failure the gate was raised to
+ * prevent. What the platform does is measure the wait and say so loudly — this
+ * is the operator agreeing that nobody is coming.
+ *
+ * Authorization lives in the RPC, which compares the caller's power against the
+ * gate's `required_role` — the same predicate `hitl_resolve` uses. Whoever
+ * could have answered the gate is who may declare that nobody did.
+ */
+export async function expireGate(
+  _prev: ExpireState,
+  formData: FormData,
+): Promise<ExpireState> {
+  const gateId = String(formData.get("gateId") ?? "");
+  const reason = String(formData.get("reason") ?? "").trim();
+
+  if (!gateId) return { error: "No gate selected.", message: null };
+
+  const supabase = await createClient();
+
+  const { data, error } = await supabase.rpc("expire_hitl_gate", {
+    p_gate_id: gateId,
+    p_reason: reason || null,
+  });
+
+  if (error) return { error: error.message, message: null };
+
+  // Outcome words rather than exceptions, matching requeueJob: two operators
+  // clearing the same stale queue have not done anything wrong.
+  const outcome = String(data);
+  const messages: Record<string, string> = {
+    expired: "Gate expired. The run behind it was stopped and nothing was committed.",
+    not_open: "That gate has already been resolved.",
+    not_overdue: `Not yet overdue — a gate can only be expired after ${REVIEW_SLA_HOURS} hours.`,
+    forbidden: "Your role cannot act on this gate.",
+    not_found: "Gate not found.",
+  };
+
+  if (outcome === "expired") {
+    revalidatePath("/dashboard");
+    return { error: null, message: messages.expired };
+  }
+
+  return { error: messages[outcome] ?? `Unexpected outcome: ${outcome}`, message: null };
 }
