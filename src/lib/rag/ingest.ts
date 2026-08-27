@@ -90,14 +90,42 @@ export async function ingestDocument(params: {
   const maskedChunks = chunks.map((chunk) => {
     const { masked, matches } = maskPii(chunk.content);
     piiMasked += matches.length;
-    return { ...chunk, content: masked };
+
+    // What gets EMBEDDED is not what gets STORED.
+    //
+    // `ai_docs` (Drive) -> Advanced Hybrid Rag -> Parent-Child Late Chunking
+    // asks that "every child chunk's semantic signature retains a
+    // representation of the global document's overall meaning". True late
+    // chunking does that by pooling token-level vectors across the whole
+    // parent — and the Gemini embeddings API does not expose token-level
+    // vectors. `embedContent` returns one pooled vector per input, with
+    // `outputDimensionality` the only shaping knob, so the technique as
+    // written is not implementable on this provider.
+    //
+    // What IS achievable is the same goal by a different route: give the
+    // embedding the chunk's place in the document. A paragraph reading "the
+    // limit is 30 days" embeds near nothing useful; the same paragraph under
+    // "Acme MSA > Termination" embeds near questions about Acme's notice
+    // period. The context comes from the document itself — title and heading
+    // trail — so it is not a guess and costs no model call.
+    //
+    // The prefix is masked along with the body: a document title is as capable
+    // of carrying a customer name as a paragraph is.
+    const context = [params.title, ...chunk.headings].filter(Boolean).join(" > ");
+    const { masked: maskedContext } = maskPii(context);
+
+    return {
+      ...chunk,
+      content: masked,
+      embedText: maskedContext ? `${maskedContext}\n\n${masked}` : masked,
+    };
   });
 
   try {
     for (let start = 0; start < maskedChunks.length; start += EMBED_BATCH_SIZE) {
       const batch = maskedChunks.slice(start, start + EMBED_BATCH_SIZE);
       const vectors = await embedBatch(
-        batch.map((chunk) => chunk.content),
+        batch.map((chunk) => chunk.embedText),
         "RETRIEVAL_DOCUMENT",
       );
 
@@ -107,9 +135,25 @@ export async function ingestDocument(params: {
           knowledge_base_id: params.knowledgeBaseId,
           parent_id: parent.id,
           chunk_index: chunk.index,
+          // Stored WITHOUT the context prefix, deliberately.
+          //
+          // `fts_tokens` is generated from this column, and repeating the
+          // title in every chunk would inflate its term frequency across the
+          // whole document — the sparse arm would then rank every chunk of a
+          // document equally for a title word, which is the opposite of what
+          // BM25 is for. The dense arm gets the context, the sparse arm gets
+          // the text; each is fed what it can actually use.
+          //
+          // It is also what a reviewer reads back, and a stored chunk that
+          // silently carries a prefix nobody wrote reads as corrupted source.
           chunk_content: chunk.content,
           embedding: JSON.stringify(vectors[offset]),
-          metadata: { title: params.title },
+          metadata: {
+            title: params.title,
+            // Kept so retrieval can show where a passage came from, and so the
+            // embedding's context is inspectable rather than implied.
+            headings: chunk.headings,
+          },
         })),
       );
 

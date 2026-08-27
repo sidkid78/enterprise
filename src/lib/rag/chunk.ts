@@ -31,6 +31,15 @@ const MIN_CHUNK_CHARS = 60;
 export type Chunk = {
   index: number;
   content: string;
+  /**
+   * The markdown heading trail this chunk sits under, outermost first.
+   *
+   * Carried so the embedding can be given the chunk's place in the document.
+   * A paragraph reading "the limit is 30 days" is retrievable only if
+   * something says which limit — and in the source that is the heading three
+   * paragraphs above, which naive chunking throws away.
+   */
+  headings: string[];
 };
 
 /**
@@ -50,19 +59,38 @@ export function chunkDocument(content: string): Chunk[] {
     .map((p) => p.trim())
     .filter(Boolean);
 
-  const pieces: string[] = [];
+  const pieces: { text: string; headings: string[] }[] = [];
   let current = "";
+  // Heading trail indexed by markdown level: trail[0] is the current H1.
+  const trail: string[] = [];
+  let currentHeadings: string[] = [];
 
   const flush = () => {
-    if (current.trim()) pieces.push(current.trim());
+    if (current.trim()) {
+      pieces.push({ text: current.trim(), headings: currentHeadings });
+    }
     current = "";
   };
 
   for (const paragraph of paragraphs) {
+    // A heading closes whatever chunk is being packed. Text under a new
+    // heading is about something else, and packing across the boundary makes a
+    // chunk whose own heading trail is wrong for half its content.
+    const heading = paragraph.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      flush();
+      const level = heading[1].length;
+      // Truncate deeper levels: an H2 ends any H3 that was open under it.
+      trail.length = level - 1;
+      trail[level - 1] = heading[2].trim();
+      currentHeadings = trail.filter(Boolean);
+      continue;
+    }
+
     if (paragraph.length > TARGET_CHUNK_CHARS) {
       flush();
       for (const sentence of splitLongParagraph(paragraph)) {
-        pieces.push(sentence);
+        pieces.push({ text: sentence, headings: currentHeadings });
       }
       continue;
     }
@@ -75,8 +103,12 @@ export function chunkDocument(content: string): Chunk[] {
   flush();
 
   return withOverlap(pieces)
-    .filter((piece) => piece.length >= MIN_CHUNK_CHARS)
-    .map((content, index) => ({ index, content }));
+    .filter((piece) => piece.text.length >= MIN_CHUNK_CHARS)
+    .map((piece, index) => ({
+      index,
+      content: piece.text,
+      headings: piece.headings,
+    }));
 }
 
 /** Breaks an oversized paragraph on sentence ends, then hard-cuts as a last resort. */
@@ -112,11 +144,13 @@ function splitLongParagraph(paragraph: string): string[] {
 }
 
 /** Prefixes each piece with the tail of the one before it. */
-function withOverlap(pieces: string[]): string[] {
+function withOverlap(
+  pieces: { text: string; headings: string[] }[],
+): { text: string; headings: string[] }[] {
   return pieces.map((piece, index) => {
     if (index === 0) return piece;
     const previous = pieces[index - 1];
-    const tail = previous.slice(-CHUNK_OVERLAP_CHARS);
-    return `${tail}\n\n${piece}`.trim();
+    const tail = previous.text.slice(-CHUNK_OVERLAP_CHARS);
+    return { ...piece, text: `${tail}\n\n${piece.text}`.trim() };
   });
 }
