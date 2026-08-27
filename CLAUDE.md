@@ -43,7 +43,7 @@ The intended full architecture lives as prose/DDL/code blocks in `ai_docs/` and 
 
 The blueprints target Next.js 15 + Supabase; the app is actually on Next.js 16 and has no Supabase dependency installed. Treat the docs as design intent, not as a description of installed reality.
 
-**There is more in Google Drive than in `ai_docs/`.** Folder `ai_docs` (id `1PTCjjbWRzEPuNBuBEBWdo1KpDMnSxGZ1`), reachable with the Google Drive MCP tools, mirrors these six blueprints at its top level and then adds seven subfolders of per-subsystem PDFs that are **not** in the repo — Governance Control Plane (the three gates, the ledger), FinOps Engine (cascade, cache, budget controls, loop guard), Multi-Agent Orchestration (DAG, decomposition, MCP, state persistence), Stateful HITL Gates (triggers, resumption, reasoning logs, RBAC), Advanced Hybrid Rag (parent/child chunking, dense, BM25, RRF), BIO ROI & Upskilling (baselines, outcome logs, SOP generator, gross margin uplift), and Infrastructure & Stack (Next.js, Supabase, GenAI SDK). Search `parentId = '<folder id>'`, then read by file id. Consult these before designing a subsystem they cover. Nothing there covers the queue, the worker fleet, or SLA availability.
+**There is more in Google Drive than in `ai_docs/`.** Folder `ai_docs` (id `1PTCjjbWRzEPuNBuBEBWdo1KpDMnSxGZ1`), reachable with the Google Drive MCP tools, mirrors these six blueprints at its top level and then adds seven subfolders of per-subsystem PDFs that are **not** in the repo — Governance Control Plane (the three gates, the ledger), FinOps Engine (cascade, cache, budget controls, loop guard), Multi-Agent Orchestration (DAG, decomposition, MCP, state persistence), Stateful HITL Gates (triggers, resumption, reasoning logs, RBAC), Advanced Hybrid Rag (parent/child chunking, dense, BM25, RRF), BIO ROI & Upskilling (baselines, outcome logs, SOP generator, gross margin uplift), and Infrastructure & Stack (Next.js, Supabase, GenAI SDK, tenant isolation via RLS). Search `parentId = '<folder id>'`, then read by file id. Consult these before designing a subsystem they cover. Nothing there covers the queue, the worker fleet, or SLA availability.
 
 ## Architecture
 
@@ -87,6 +87,21 @@ Three clients, and the distinction matters:
 | `lib/supabase/service.ts` | service role, **bypasses RLS** | agent runtime writes only; never import from a Client Component |
 
 RLS conventions the migrations follow, which new tables should match: every table has RLS enabled; policies are `TO authenticated` **plus** an ownership predicate (role alone is not authorization); every UPDATE policy carries both `USING` and `WITH CHECK`; membership checks go through `private.is_workspace_member()` / `private.has_workspace_role()` rather than selecting `workspace_members` directly (a policy on that table cannot query itself). Those helpers are `SECURITY DEFINER` in an unexposed `private` schema with `EXECUTE` granted only to `authenticated`.
+
+**Do not replace these with the blueprint's Dynamic Policy Generator.** `ai_docs` (Drive) → Infrastructure & Stack → `tenant-isolation-via-RLS.pdf` proposes deploying one uniform policy across every table via a PL/pgSQL `DO` loop:
+
+```sql
+CREATE POLICY tenant_isolation_<t> ON <t> FOR ALL
+USING (workspace_id IN (SELECT workspace_id FROM workspace_members WHERE user_id = auth.uid()))
+```
+
+Everything else in that document is already true here — verified against the live database: RLS on **25/25** public tables (the doc says 22; `agent_workers`, `agent_job_queue` and `workspace_invitations` came later), `idx_document_chunks_tenant` present alongside the HNSW and GIN indexes, the SSR cookie session carrying the JWT to `auth.uid()`, and the 1–5 role hierarchy that migration `…22` implements. Only the generator is wrong for this schema, and adopting it would be a regression:
+
+- **`FOR ALL` is tenant isolation and nothing else.** It grants every member — a `business_user`, power 1, included — INSERT/UPDATE/DELETE on every table in their workspace. That would let them delete `agent_audit_ledger` rows (the only policy there is SELECT, and only for three roles), raise their own `finops_budget_controls` cap (UPDATE is owner/admin), and delete `hitl_approval_gates` (the sole write path is `hitl_resolve`, with the power check and the ratchet trigger).
+- **`semantic_cache` must keep zero policies.** It is the one table with RLS on and nothing attached, because it stores verbatim prompts. The generator would hand every member read access to them.
+- It omits `TO authenticated` (no policy here applies to `public` — check with `select * from pg_policies where roles = '{public}'`) and inlines a `workspace_members` subquery instead of the `private.` helpers.
+
+Membership answers **which tenant**; it never answers **what may this person do**. Keeping those separate is what the whole RBAC hierarchy rests on.
 
 Two tables are deliberately client-invisible: `semantic_cache` has RLS on with **no policies** (it stores verbatim prompts — highest PII risk), and `agent_audit_ledger` is append-only via trigger with hashes computed server-side. Tables also need explicit `GRANT`s — since 2026-04-28 new public tables are not auto-exposed to the Data API.
 
