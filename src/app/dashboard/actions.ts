@@ -1,0 +1,210 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+
+import { createClient } from "@/lib/supabase/server";
+import { ROLE_POWER, type UserRole } from "@/lib/roles";
+
+export type ResolveDecision = "approve" | "reject" | "escalate";
+
+export type ResolveState = {
+  error: string | null;
+  ok: boolean;
+  /** Outcome of resuming the DAG, shown after a successful decision. */
+  message?: string | null;
+};
+
+/**
+ * Escalation is not a decision — it is a referral.
+ *
+ * The other two answer the question the gate asks and let the DAG move; this
+ * one leaves the question open and raises the rank needed to answer it, per
+ * `ai_docs` (Drive) -> Stateful HITL Gates -> Role-based access-control:
+ * "updates the required_role on the ACTIVE record ... restricting resolution
+ * power to high-tier personnel".
+ *
+ * It used to be treated as terminal, and that parked runs permanently: the
+ * gate left `pending`, so it dropped out of the queue view AND out of the set
+ * of rows the `hitl_resolve` policy would admit, leaving nobody — owner
+ * included — able to touch it again. Migration ...22 makes `escalated` an open
+ * state; this keeps the two consistent.
+ */
+const DECISION_STATUS: Record<ResolveDecision, string> = {
+  approve: "approved",
+  reject: "rejected",
+  escalate: "escalated",
+};
+
+/** Statuses a gate can be acted on from. Mirrors the `hitl_resolve` policy. */
+const OPEN_STATUSES = ["pending", "escalated"];
+
+function isDecision(value: string): value is ResolveDecision {
+  return value in DECISION_STATUS;
+}
+
+function isRole(value: string): value is UserRole {
+  return value in ROLE_POWER;
+}
+
+/**
+ * Resolves a pending HITL gate.
+ *
+ * Authorization is not re-implemented here — this uses the user-scoped client,
+ * so the `hitl_resolve` RLS policy decides whether the update is allowed. A
+ * caller without the required role matches zero rows and gets a clear error
+ * rather than a silent no-op.
+ */
+export async function resolveGate(
+  _prev: ResolveState,
+  formData: FormData,
+): Promise<ResolveState> {
+  const gateId = String(formData.get("gateId") ?? "");
+  const decision = String(formData.get("decision") ?? "");
+  const feedback = String(formData.get("feedback") ?? "").trim();
+  const overrideRaw = String(formData.get("overridePayload") ?? "").trim();
+  const escalateTo = String(formData.get("escalateTo") ?? "").trim();
+
+  if (!gateId || !isDecision(decision)) {
+    return { ok: false, error: "Invalid decision." };
+  }
+
+  const update: Record<string, unknown> = {
+    status: DECISION_STATUS[decision],
+    human_feedback: feedback || null,
+  };
+
+  // Only a decision is a resolution. Stamping resolved_at on an escalation
+  // would record the gate as settled at the moment it was handed to somebody
+  // else, and the ledger would show a reviewer resolving something they
+  // explicitly declined to resolve.
+  if (decision !== "escalate") {
+    update.resolved_at = new Date().toISOString();
+  }
+
+  // An override rewrites the payload the DAG will resume with, so it must be
+  // valid JSON — never forward an unparsed string into the execution record.
+  if (overrideRaw) {
+    try {
+      const parsed = JSON.parse(overrideRaw);
+      if (parsed === null || typeof parsed !== "object") {
+        return { ok: false, error: "Override must be a JSON object." };
+      }
+      update.output_payload = parsed;
+    } catch {
+      return { ok: false, error: "Override is not valid JSON." };
+    }
+  }
+
+  const supabase = await createClient();
+
+  const { data: claims } = await supabase.auth.getClaims();
+  if (!claims?.claims?.sub) {
+    return { ok: false, error: "Not signed in." };
+  }
+  // Who acted, whichever way they acted. An escalation is still a human
+  // touching the gate, and the reviewer who passed it upward is exactly who an
+  // auditor asks about later.
+  update.resolved_by = claims.claims.sub;
+
+  if (decision === "escalate") {
+    // Read the current bar before raising it. The database ratchets
+    // required_role upward regardless (migration ...22), but a policy error is
+    // a poor way to tell a reviewer that the tier they picked is not above the
+    // one already set.
+    const { data: current } = await supabase
+      .from("hitl_approval_gates")
+      .select("required_role")
+      .eq("id", gateId)
+      .maybeSingle();
+
+    const currentRole = (current as { required_role: UserRole } | null)
+      ?.required_role;
+
+    if (!currentRole) {
+      return { ok: false, error: "Gate not found." };
+    }
+
+    if (!isRole(escalateTo)) {
+      return { ok: false, error: "Pick a tier to escalate to." };
+    }
+
+    if (ROLE_POWER[escalateTo] <= ROLE_POWER[currentRole]) {
+      return {
+        ok: false,
+        error: `Escalating to ${escalateTo} would not raise the bar above ${currentRole}.`,
+      };
+    }
+
+    update.required_role = escalateTo;
+  }
+
+  const { data, error } = await supabase
+    .from("hitl_approval_gates")
+    .update(update)
+    .eq("id", gateId)
+    .in("status", OPEN_STATUSES)
+    .select("id, graph_execution_id, workspace_id");
+
+  if (error) {
+    return { ok: false, error: error.message };
+  }
+
+  if (!data || data.length === 0) {
+    return {
+      ok: false,
+      error:
+        "Gate could not be resolved — it may already be resolved, or your role does not permit it.",
+    };
+  }
+
+  // The RLS UPDATE above is the authorization check — reaching here means the
+  // caller was permitted to resolve this gate, so it is safe to hand off to the
+  // service-role runtime.
+  const graphExecutionId = (data[0] as { graph_execution_id: string })
+    .graph_execution_id;
+
+  // Dispatch rather than drive. The reviewer's click does not hold a connection
+  // open for however long the rest of the graph takes — it queues the
+  // continuation and returns. The worker picks up the same persisted state and
+  // carries on from the halted node.
+  const workspaceId = (data[0] as { workspace_id: string }).workspace_id;
+
+  // Escalation queues nothing. The gate is still open, so there is no
+  // continuation to run — a resume job would claim the graph, find the gate
+  // undecided, and return `waiting_hitl` having done nothing but occupy a
+  // worker and the one active-job slot the graph is allowed.
+  if (decision === "escalate") {
+    revalidatePath("/dashboard");
+    return {
+      ok: true,
+      error: null,
+      message: `Escalated to ${escalateTo}. The run stays paused until someone at that tier decides.`,
+    };
+  }
+
+  let resumeMessage: string | null = null;
+  try {
+    const { enqueueJob } = await import("@/lib/queue/jobs");
+    const { createServiceClient } = await import("@/lib/supabase/service");
+
+    const { error: queueError } = await enqueueJob(createServiceClient(), {
+      workspaceId,
+      graphExecutionId,
+      jobType: "resume",
+    });
+
+    resumeMessage = queueError
+      ? `Decision saved, but queueing the continuation failed: ${queueError}`
+      : "Decision saved. The run continues in the background.";
+  } catch (err) {
+    // The human's decision is already committed and must not be rolled back
+    // because the queue failed. Surface it and leave the record intact.
+    resumeMessage =
+      err instanceof Error
+        ? `Decision saved, but resuming failed: ${err.message}`
+        : "Decision saved, but resuming failed.";
+  }
+
+  revalidatePath("/dashboard");
+  return { ok: true, error: null, message: resumeMessage };
+}

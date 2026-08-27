@@ -1,5 +1,5 @@
 {
-  "model": "gemini-3.6-flash",
+  "model": "gemini-3.7-flash",
   "thinking_level": "HIGH",
   "workspace": ".",
   "specs_dir": "./specs",

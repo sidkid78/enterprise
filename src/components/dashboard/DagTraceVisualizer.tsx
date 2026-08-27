@@ -1,193 +1,342 @@
-'use client';
+"use client";
 
-import React, { useState } from 'react';
+import { useState } from "react";
 
-interface DagNode {
-  id: string;
-  agentRole: string;
-  model: string;
-  status: 'completed' | 'running' | 'waiting_hitl' | 'failed';
-  latencyMs: number;
-  tokensUsed: number;
-  costUsd: number;
-  dependencies: string[];
-  outputSnippet: string;
-}
+import type { DagNode, GraphExecution } from "@/lib/data/dag";
 
-export default function DagTraceVisualizer({ workspaceId }: { workspaceId: string }) {
-  const [selectedNode, setSelectedNode] = useState<DagNode | null>(null);
+import JsonView from "./JsonView";
 
-  const dagNodes: DagNode[] = [
-    {
-      id: 'task_01',
-      agentRole: 'DecompositionOrchestrator',
-      model: 'gemini-3.5-flash-lite',
-      status: 'completed',
-      latencyMs: 310,
-      tokensUsed: 1420,
-      costUsd: 0.000213,
-      dependencies: [],
-      outputSnippet: 'Deconstructed abstract query into 3 worker agent DAG steps.'
-    },
-    {
-      id: 'task_02',
-      agentRole: 'SAPDataExtractor',
-      model: 'gemini-3.7-flash',
-      status: 'completed',
-      latencyMs: 820,
-      tokensUsed: 4200,
-      costUsd: 0.002100,
-      dependencies: ['task_01'],
-      outputSnippet: 'Extracted 142 line items from SAP ERP tables.'
-    },
-    {
-      id: 'task_03',
-      agentRole: 'DeepFinancialAuditor',
-      model: 'gemini-3.1-pro-preview',
-      status: 'waiting_hitl',
-      latencyMs: 1450,
-      tokensUsed: 12400,
-      costUsd: 0.037200,
-      dependencies: ['task_02'],
-      outputSnippet: 'Computed potential $14,500 compliance deviation. Triggered HITL.'
-    },
-    {
-      id: 'task_04',
-      agentRole: 'ERPWritebackWorker',
-      model: 'gemini-3.7-flash',
-      status: 'running',
-      latencyMs: 0,
-      tokensUsed: 0,
-      costUsd: 0,
-      dependencies: ['task_03'],
-      outputSnippet: 'Awaiting HITL gate clearance before SAP writeback...'
-    }
-  ];
-
-  const getStatusBadge = (status: DagNode['status']) => {
-    switch (status) {
-      case 'completed':
-        return <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">COMPLETED</span>;
-      case 'running':
-        return <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 animate-pulse">EXECUTING</span>;
-      case 'waiting_hitl':
-        return <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-amber-500/10 text-amber-400 border border-amber-500/30">HALTED (HITL)</span>;
-      case 'failed':
-        return <span className="px-2 py-0.5 text-[10px] font-bold rounded bg-rose-500/10 text-rose-400 border border-rose-500/30">FAILED</span>;
-    }
+function StatusBadge({ status }: { status: DagNode["status"] }) {
+  const styles: Record<DagNode["status"], string> = {
+    completed:
+      "bg-emerald-500/10 text-emerald-400 border-emerald-500/30",
+    running: "bg-cyan-500/10 text-cyan-400 border-cyan-500/30 animate-pulse",
+    waiting_hitl: "bg-amber-500/10 text-amber-400 border-amber-500/30",
+    failed: "bg-rose-500/10 text-rose-400 border-rose-500/30",
+  };
+  const labels: Record<DagNode["status"], string> = {
+    completed: "COMPLETED",
+    running: "EXECUTING",
+    waiting_hitl: "HALTED (HITL)",
+    failed: "FAILED",
   };
 
   return (
-    <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-xl">
-      <div className="flex items-center justify-between pb-4 border-b border-slate-800 mb-6">
+    <span
+      className={`rounded border px-2 py-0.5 text-[10px] font-bold ${styles[status]}`}
+    >
+      {labels[status]}
+    </span>
+  );
+}
+
+/**
+ * The prose deliverable inside a node's `result`, when there is one. Returns
+ * null for payloads that are genuinely structured, which read better as a tree.
+ */
+function resultMarkdown(result: unknown): string | null {
+  if (result == null || typeof result !== "object") return null;
+  const value = result as Record<string, unknown>;
+  const body =
+    typeof value.content_markdown === "string" ? value.content_markdown : null;
+  if (!body) return null;
+  const heading = typeof value.heading === "string" ? value.heading : null;
+  return heading ? `${heading}\n\n${body}` : body;
+}
+
+export default function DagTraceVisualizer({
+  executions,
+}: {
+  executions: GraphExecution[];
+}) {
+  const [activeExecutionId, setActiveExecutionId] = useState(
+    executions[0]?.id ?? null,
+  );
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [deliverableOpen, setDeliverableOpen] = useState(true);
+  const [copied, setCopied] = useState(false);
+
+  if (executions.length === 0) {
+    return (
+      <div className="rounded-xl border border-dashed border-slate-800 bg-slate-900 p-12 text-center">
+        <p className="text-sm text-slate-400">No agent runs recorded yet.</p>
+        <p className="mt-1 text-xs text-slate-500">
+          Executions appear here as soon as the orchestrator starts a graph.
+        </p>
+      </div>
+    );
+  }
+
+  const execution =
+    executions.find((e) => e.id === activeExecutionId) ?? executions[0];
+  const selectedNode =
+    execution.nodes.find((n) => n.id === selectedNodeId) ?? null;
+
+  const totalLatencyMs = execution.nodes.reduce(
+    (sum, n) => sum + n.latencyMs,
+    0,
+  );
+  // Node rows exclude the planning call and the critic gates, so the logged
+  // figure is the one to show when we have it.
+  const nodeCost = execution.nodes.reduce((sum, n) => sum + n.costUsd, 0);
+  const totalCost = execution.trueCostUsd ?? nodeCost;
+
+  return (
+    <div className="rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 pb-4">
         <div>
-          <h2 className="text-base font-bold text-white flex items-center space-x-2">
+          <h2 className="flex flex-wrap items-center gap-2 text-base font-bold text-white">
             <span>DAG Execution Graph Visualizer</span>
-            <span className="text-xs text-cyan-400 font-mono bg-cyan-500/10 px-2 py-0.5 rounded border border-cyan-500/20">
-              Graph ID: exec_dag_9901
-            </span>
+            <select
+              value={execution.id}
+              onChange={(event) => {
+                setActiveExecutionId(event.target.value);
+                setSelectedNodeId(null);
+                setCopied(false);
+              }}
+              className="rounded border border-cyan-500/20 bg-cyan-500/10 px-2 py-0.5 font-mono text-xs text-cyan-400 focus:outline-none"
+            >
+              {executions.map((e) => (
+                <option key={e.id} value={e.id}>
+                  {e.id.slice(0, 8)} · {e.status}
+                </option>
+              ))}
+            </select>
           </h2>
-          <p className="text-xs text-slate-400">Real-time stateful multi-agent execution tracing & model tier routing for {workspaceId}</p>
+          <p className="mt-1 truncate text-xs text-slate-400">
+            {execution.orchestratorName} — {execution.rootPrompt}
+          </p>
         </div>
 
-        <div className="flex items-center space-x-4 text-xs font-mono">
+        <div className="flex items-center space-x-4 font-mono text-xs">
           <div>
             <span className="text-slate-400">Total Latency: </span>
-            <span className="text-slate-200 font-bold">2.58s</span>
+            <span className="font-bold text-slate-200">
+              {(totalLatencyMs / 1000).toFixed(2)}s
+            </span>
           </div>
           <div>
             <span className="text-slate-400">Execution Cost: </span>
-            <span className="text-cyan-400 font-bold">$0.039513</span>
+            <span className="font-bold text-cyan-400">
+              ${totalCost.toFixed(6)}
+            </span>
+            {execution.trueCostUsd !== null && totalCost > nodeCost && (
+              <span
+                className="ml-1 text-[10px] text-slate-500"
+                title="Includes the planning call and critic gates, which belong to no single node."
+              >
+                (incl. orchestration)
+              </span>
+            )}
           </div>
         </div>
       </div>
 
-      {/* DAG Node Workflow Map with SVG Connectors */}
-      <div className="relative mb-8 pt-4">
-        {/* Decorative SVG Connectors (Simulated for fixed 4-grid) */}
-        <div className="absolute inset-0 pointer-events-none hidden md:block">
-          <svg className="w-full h-full" style={{ zIndex: 0 }}>
-            <path d="M 12% 50% L 38% 50%" stroke="rgba(14, 165, 233, 0.3)" strokeWidth="2" fill="none" strokeDasharray="4 4" className="animate-pulse" />
-            <path d="M 38% 50% L 62% 50%" stroke="rgba(14, 165, 233, 0.3)" strokeWidth="2" fill="none" strokeDasharray="4 4" className="animate-pulse" />
-            <path d="M 62% 50% L 88% 50%" stroke="rgba(245, 158, 11, 0.3)" strokeWidth="2" fill="none" strokeDasharray="4 4" />
-          </svg>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 relative z-10">
-          {dagNodes.map((node, index) => {
-            const isSelected = selectedNode?.id === node.id;
-            return (
-              <div
-                key={node.id}
-                onClick={() => setSelectedNode(node)}
-                className={`p-4 rounded-xl border relative cursor-pointer transition-all duration-300 ${
-                  isSelected
-                    ? 'bg-slate-800 border-cyan-500 shadow-[0_0_20px_rgba(6,182,212,0.15)] scale-105'
-                    : 'bg-slate-950/80 backdrop-blur-md border-slate-800 hover:border-slate-700 hover:bg-slate-900'
-                }`}
+      {/*
+        The deliverable comes first: it is what the run was for. The node grid
+        below is the audit trail behind it, not the answer.
+      */}
+      {execution.deliverable && (
+        <div className="mb-8 rounded-xl border border-cyan-900/60 bg-slate-950/60 backdrop-blur">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-3">
+            <button
+              type="button"
+              onClick={() => setDeliverableOpen((open) => !open)}
+              aria-expanded={deliverableOpen}
+              className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-cyan-400 hover:text-cyan-300"
+            >
+              <span
+                className={`inline-block transition-transform ${deliverableOpen ? "rotate-90" : ""}`}
+                aria-hidden="true"
               >
-                <div className="flex items-center justify-between mb-3">
-                  <span className="text-[10px] font-mono text-slate-500">Step {index + 1}</span>
-                  {getStatusBadge(node.status)}
-                </div>
+                ▸
+              </span>
+              <span>Run Deliverable</span>
+            </button>
 
-                <h3 className="text-sm font-bold text-slate-100 mb-1">{node.agentRole}</h3>
-                <span className="text-[10px] font-mono text-cyan-400 bg-slate-900/50 px-2 py-0.5 rounded border border-slate-800 block w-fit mb-4">
-                  {node.model}
+            <div className="flex items-center gap-3">
+              {execution.deliverable.cachedNodeCount > 0 && (
+                <span className="rounded border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-indigo-300">
+                  {execution.deliverable.cachedNodeCount} cached
                 </span>
+              )}
+              <button
+                type="button"
+                onClick={async () => {
+                  // Clipboard access can be denied (insecure origin, permission
+                  // policy); a failed copy must not blank the panel.
+                  try {
+                    await navigator.clipboard.writeText(
+                      execution.deliverable!.markdown,
+                    );
+                    setCopied(true);
+                  } catch {
+                    setCopied(false);
+                  }
+                }}
+                className="rounded border border-slate-700 bg-slate-900 px-2 py-1 font-mono text-[10px] text-slate-300 hover:border-cyan-500/50 hover:text-cyan-300"
+              >
+                {copied ? "Copied" : "Copy Markdown"}
+              </button>
+            </div>
+          </div>
 
-                <div className="text-[10px] text-slate-400 space-y-1.5 pt-3 border-t border-slate-800/80">
-                  <div className="flex justify-between items-center">
-                    <span>Latency:</span>
-                    <span className="font-mono text-slate-300 font-medium">{node.latencyMs > 0 ? `${node.latencyMs}ms` : '--'}</span>
-                  </div>
-                  <div className="flex justify-between items-center">
-                    <span>Token Cost:</span>
-                    <span className="font-mono text-slate-300 font-medium">${node.costUsd.toFixed(6)}</span>
-                  </div>
+          {deliverableOpen && (
+            <div className="max-h-128 overflow-auto px-5 py-4">
+              <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-slate-300">
+                {execution.deliverable.markdown}
+              </pre>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/*
+        The mock drew fixed SVG connector paths between exactly four evenly
+        spaced nodes. Real graphs vary in width, so the edges are rendered per
+        card from `dependencies` instead — a decorative line that contradicts
+        the actual DAG is worse than no line.
+      */}
+      <div className="mb-8 grid grid-cols-1 gap-6 pt-4 md:grid-cols-2 lg:grid-cols-4">
+        {execution.nodes.map((node, index) => {
+          const isSelected = selectedNode?.id === node.id;
+          return (
+            <button
+              key={node.id}
+              type="button"
+              onClick={() => setSelectedNodeId(node.id)}
+              aria-pressed={isSelected}
+              className={`relative cursor-pointer rounded-xl border p-4 text-left transition-all duration-300 ${
+                isSelected
+                  ? "scale-105 border-cyan-500 bg-slate-800 shadow-[0_0_20px_rgba(6,182,212,0.15)]"
+                  : "border-slate-800 bg-slate-950/80 backdrop-blur-md hover:border-slate-700 hover:bg-slate-900"
+              }`}
+            >
+              <div className="mb-3 flex items-center justify-between">
+                <span className="font-mono text-[10px] text-slate-500">
+                  Step {index + 1}
+                </span>
+                <StatusBadge status={node.status} />
+              </div>
+
+              <h3 className="mb-1 text-sm font-bold text-slate-100">
+                {node.agentRole}
+              </h3>
+              <span className="mb-4 block w-fit rounded border border-slate-800 bg-slate-900/50 px-2 py-0.5 font-mono text-[10px] text-cyan-400">
+                {node.model}
+              </span>
+
+              <div className="space-y-1.5 border-t border-slate-800/80 pt-3 text-[10px] text-slate-400">
+                <div className="flex items-center justify-between">
+                  <span>Latency:</span>
+                  <span className="font-mono font-medium text-slate-300">
+                    {node.latencyMs > 0 ? `${node.latencyMs}ms` : "--"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>Token Cost:</span>
+                  <span className="font-mono font-medium text-slate-300">
+                    ${node.costUsd.toFixed(6)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span>Depends on:</span>
+                  <span className="font-mono font-medium text-slate-300">
+                    {node.dependencies.length > 0
+                      ? node.dependencies.join(", ")
+                      : "root"}
+                  </span>
                 </div>
               </div>
-            );
-          })}
-        </div>
+            </button>
+          );
+        })}
       </div>
 
-      {/* Selected Node Output Inspector */}
       {selectedNode ? (
-        <div className="bg-slate-950/80 backdrop-blur border border-slate-800 rounded-xl p-5 mt-2 transform transition-all animate-in fade-in slide-in-from-bottom-2">
-          <div className="flex items-center justify-between mb-4 border-b border-slate-800 pb-3">
-            <h4 className="text-xs font-bold text-cyan-400 uppercase tracking-wider flex items-center space-x-2">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" /></svg>
+        <div className="mt-2 rounded-xl border border-slate-800 bg-slate-950/80 p-5 backdrop-blur">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+            <h4 className="flex items-center space-x-2 text-xs font-bold uppercase tracking-wider text-cyan-400">
+              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" /></svg>
               <span>Node Inspector — [{selectedNode.agentRole}]</span>
             </h4>
-            <span className="text-xs font-mono text-slate-500 bg-slate-900 px-2 py-1 rounded">Dependencies: {selectedNode.dependencies.join(', ') || 'None'}</span>
+            <span className="rounded bg-slate-900 px-2 py-1 font-mono text-xs text-slate-500">
+              Dependencies: {selectedNode.dependencies.join(", ") || "None"}
+            </span>
           </div>
 
-          <div className="relative group">
-            <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/10 to-transparent rounded opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none"></div>
-            <p className="text-xs text-slate-300 font-mono bg-slate-900 p-4 rounded-lg border border-slate-800 mb-4 leading-relaxed">
-              {selectedNode.outputSnippet}
-            </p>
-          </div>
+          <p className="mb-4 whitespace-pre-wrap break-words rounded-lg border border-slate-800 bg-slate-900 p-4 font-mono text-xs leading-relaxed text-slate-300">
+            {selectedNode.outputSnippet}
+          </p>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">
-            <div className="bg-slate-900/50 p-3 rounded-lg border border-slate-800/80">
-              <span className="text-slate-500 block text-[10px] uppercase font-bold mb-1">Tokens Consumed</span>
-              <span className="font-mono text-slate-200 text-sm">{selectedNode.tokensUsed.toLocaleString()} <span className="text-[10px] text-slate-500">tks</span></span>
+          {/*
+            The work product itself. Previously only the one-line summary was
+            rendered, so a completed run gave no way to see what it actually
+            produced — the reason to run it at all.
+          */}
+          {selectedNode.result != null && (
+            <div className="mb-4">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-cyan-400">
+                  Work Product
+                </span>
+                {selectedNode.fromCache && (
+                  <span className="rounded border border-indigo-500/30 bg-indigo-500/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-indigo-300">
+                    Served from cache
+                  </span>
+                )}
+              </div>
+              <div className="max-h-96 overflow-auto rounded-lg border border-cyan-900/50 bg-[#0d1117] p-4">
+                {/*
+                  Workers write the deliverable into `content_markdown`. Piping
+                  a long prose string through the JSON view renders it as one
+                  escaped line, so prose is shown as prose and only genuinely
+                  structured payloads (or a human override) get the tree.
+                */}
+                {resultMarkdown(selectedNode.result) ? (
+                  <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-slate-300">
+                    {resultMarkdown(selectedNode.result)}
+                  </pre>
+                ) : (
+                  <pre className="font-mono text-[11px] leading-relaxed">
+                    <JsonView value={selectedNode.result} />
+                  </pre>
+                )}
+              </div>
             </div>
-            <div className="bg-slate-900/50 p-3 rounded-lg border border-slate-800/80">
-              <span className="text-slate-500 block text-[10px] uppercase font-bold mb-1">Model Router Tier</span>
-              <span className="font-mono text-cyan-400 text-sm">{selectedNode.model}</span>
+          )}
+
+          <div className="grid grid-cols-1 gap-4 text-xs sm:grid-cols-3">
+            <div className="rounded-lg border border-slate-800/80 bg-slate-900/50 p-3">
+              <span className="mb-1 block text-[10px] font-bold uppercase text-slate-500">
+                Tokens Consumed
+              </span>
+              <span className="font-mono text-sm text-slate-200">
+                {selectedNode.tokensUsed.toLocaleString()}{" "}
+                <span className="text-[10px] text-slate-500">tks</span>
+              </span>
             </div>
-            <div className="bg-slate-900/50 p-3 rounded-lg border border-slate-800/80">
-              <span className="text-slate-500 block text-[10px] uppercase font-bold mb-1">Calculated Cost</span>
-              <span className="font-mono text-emerald-400 text-sm">${selectedNode.costUsd.toFixed(6)}</span>
+            <div className="rounded-lg border border-slate-800/80 bg-slate-900/50 p-3">
+              <span className="mb-1 block text-[10px] font-bold uppercase text-slate-500">
+                Model Router Tier
+              </span>
+              <span className="font-mono text-sm text-cyan-400">
+                {selectedNode.model}
+              </span>
+            </div>
+            <div className="rounded-lg border border-slate-800/80 bg-slate-900/50 p-3">
+              <span className="mb-1 block text-[10px] font-bold uppercase text-slate-500">
+                Calculated Cost
+              </span>
+              <span className="font-mono text-sm text-emerald-400">
+                ${selectedNode.costUsd.toFixed(6)}
+              </span>
             </div>
           </div>
         </div>
       ) : (
-        <div className="text-center py-8 text-xs text-slate-500 bg-slate-950/40 rounded-xl border border-slate-800 border-dashed">
-          Click any DAG node above to inspect its execution output and telemetry data.
+        <div className="rounded-xl border border-dashed border-slate-800 bg-slate-950/40 py-8 text-center text-xs text-slate-500">
+          Select any DAG node above to inspect its execution output and telemetry.
         </div>
       )}
     </div>
