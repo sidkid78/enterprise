@@ -43,6 +43,7 @@ import {
   getWorkerFleet,
 } from "@/lib/data/queue";
 import { getInvitations, getMembers } from "@/lib/data/members";
+import { getAgentMessages } from "@/lib/data/messages";
 import { getTrainingModules } from "@/lib/data/workforce";
 import { getUserClaims, resolveActiveWorkspace } from "@/lib/data/workspaces";
 import { ROLE_POWER, type UserRole } from "@/lib/roles";
@@ -257,9 +258,7 @@ export default async function EnterpriseDashboardPage({
             viewerRole={active.role}
           />
         )}
-        {tab === "dag" && (
-          <DagTraceVisualizer executions={await getRecentExecutions(active.id)} />
-        )}
+        {tab === "dag" && <DagTab workspaceId={active.id} />}
         {tab === "knowledge" && (
           <KnowledgeBaseHub
             workspaceId={active.id}
@@ -311,6 +310,30 @@ export default async function EnterpriseDashboardPage({
  * `canManage` only decides whether to render controls that would otherwise
  * fail.
  */
+/**
+ * The DAG tab and its transcripts.
+ *
+ * Transcripts are fetched for every execution shown rather than for the
+ * selected one, because which execution is selected is client state and a
+ * server component cannot see it. Five runs of a handful of turns each is a
+ * small enough read to prefer over a round trip on every selection.
+ */
+async function DagTab({ workspaceId }: { workspaceId: string }) {
+  const executions = await getRecentExecutions(workspaceId);
+
+  const transcripts = Object.fromEntries(
+    await Promise.all(
+      executions.map(
+        async (e) => [e.id, await getAgentMessages(e.id)] as const,
+      ),
+    ),
+  );
+
+  return (
+    <DagTraceVisualizer executions={executions} transcripts={transcripts} />
+  );
+}
+
 async function AccessTab({
   workspaceId,
   viewerRole,

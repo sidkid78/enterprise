@@ -3,7 +3,9 @@
 import { useState } from "react";
 
 import type { DagNode, GraphExecution } from "@/lib/data/dag";
+import type { AgentMessage } from "@/lib/data/messages";
 
+import AgentTranscript from "./AgentTranscript";
 import JsonView from "./JsonView";
 
 function StatusBadge({ status }: { status: DagNode["status"] }) {
@@ -46,8 +48,11 @@ function resultMarkdown(result: unknown): string | null {
 
 export default function DagTraceVisualizer({
   executions,
+  transcripts,
 }: {
   executions: GraphExecution[];
+  /** Turns per execution id. Empty for runs that predate migration ...25. */
+  transcripts: Record<string, AgentMessage[]>;
 }) {
   const [activeExecutionId, setActiveExecutionId] = useState(
     executions[0]?.id ?? null,
@@ -339,6 +344,14 @@ export default function DagTraceVisualizer({
           Select any DAG node above to inspect its execution output and telemetry.
         </div>
       )}
+
+      {/*
+        Scoped to the whole run rather than the selected node. The turns are a
+        conversation — a step's input quotes the summaries of the steps before
+        it — so reading one node's messages in isolation hides where its context
+        came from, which is usually the thing being audited.
+      */}
+      <AgentTranscript messages={transcripts[execution.id] ?? []} />
     </div>
   );
 }
