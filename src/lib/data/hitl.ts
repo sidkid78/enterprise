@@ -10,12 +10,13 @@ import { createClient } from "@/lib/supabase/server";
  */
 const OPEN_STATUSES = ["pending", "escalated"];
 
-/**
- * Mirrors `private.hitl_review_sla_hours()`. A UI affordance only — the
- * database re-checks it, and `expire_hitl_gate` refuses a gate that is not
- * actually overdue.
- */
-export const REVIEW_SLA_HOURS = 24;
+// Re-exported so existing server-side importers keep working. The definitions
+// live in a module with no `server-only` marker, because the HITL queue is a
+// Client Component and a VALUE imported from here pulls `next/headers` into the
+// browser bundle.
+export { REVIEW_SLA_HOURS, CLAIM_TTL_MINUTES } from "@/lib/hitl/review-window";
+import { CLAIM_TTL_MINUTES } from "@/lib/hitl/review-window";
+import { REVIEW_SLA_HOURS } from "@/lib/hitl/review-window";
 
 import type { UserRole } from "@/lib/roles";
 
@@ -53,6 +54,33 @@ export type PendingGate = {
   reasoningSummary: ReasoningSummary;
   inputPayload: Record<string, unknown>;
   outputPayload: Record<string, unknown>;
+
+  // ---- who is on it ----------------------------------------------------
+  /**
+   * The live claim holder, or null when nobody is working on this.
+   *
+   * A CLAIM, made by the reviewer themselves — not a dispatch. The blueprint
+   * routes gates to a role and never to a person, so nothing here decides who
+   * ought to act; it only records who said they are.
+   *
+   * Null once the claim lapses, so a reviewer who walked away cannot hold a
+   * gate indefinitely. Liveness is judged in SQL against the same TTL the claim
+   * function uses, never stored as a flag — a person who closes their laptop
+   * cannot write down that they stopped.
+   */
+  claimedBy: { userId: string; email: string | null } | null;
+  claimedAt: string | null;
+  /** True when the live claim is the viewer's own. */
+  claimedByMe: boolean;
+  /**
+   * Minutes left on a live claim, or null when there is none.
+   *
+   * Computed here from the same server-side clock read as `ageHours`, for the
+   * same reason: the dashboard only changes on navigation, so a countdown
+   * derived during render would drift against rows frozen at page load — and
+   * React's compiler lint rejects the impure call anyway.
+   */
+  claimMinutesLeft: number | null;
 };
 
 /**
@@ -87,6 +115,7 @@ function firstOf<T>(value: T | T[] | null | undefined): T | null {
 
 export async function getPendingGates(
   workspaceId: string,
+  viewerId: string | null = null,
 ): Promise<PendingGate[]> {
   const supabase = await createClient();
 
@@ -103,6 +132,8 @@ export async function getPendingGates(
        input_payload,
        output_payload,
        status,
+       assigned_user_id,
+       assigned_at,
        agent_node_executions ( agent_role )`,
     )
     .eq("workspace_id", workspaceId)
@@ -125,6 +156,8 @@ export async function getPendingGates(
     reasoning_log_summary: unknown;
     input_payload: Record<string, unknown> | null;
     output_payload: Record<string, unknown> | null;
+    assigned_user_id: string | null;
+    assigned_at: string | null;
     // PostgREST embeds a to-one relation as an object, but the generated
     // typings widen it to an array. Accept both and normalize.
     agent_node_executions:
@@ -134,10 +167,41 @@ export async function getPendingGates(
   };
 
   const observedAt = Date.now();
+  const rows = (data ?? []) as unknown as Row[];
 
-  return ((data ?? []) as unknown as Row[]).map((row) => {
+  // Name the claim holders. A uuid is not an identity — "claimed by c91ea881"
+  // reads as a name while conveying nothing — so the directory is consulted
+  // once for the whole list rather than per row. Same rule as DecisionHistory.
+  const holderIds = new Set(
+    rows
+      .filter((r) => isClaimLive(r.assigned_user_id, r.assigned_at, observedAt))
+      .map((r) => r.assigned_user_id!)
+      .filter((id) => id !== viewerId),
+  );
+
+  const emails = new Map<string, string>();
+
+  if (holderIds.size > 0) {
+    const { data: directory } = await supabase.rpc(
+      "workspace_member_directory",
+      { p_workspace_id: workspaceId },
+    );
+
+    for (const member of (directory ?? []) as {
+      user_id: string;
+      email: string;
+    }[]) {
+      emails.set(member.user_id, member.email);
+    }
+  }
+
+  return rows.map((row) => {
     const ageHours =
       (observedAt - new Date(row.created_at).getTime()) / 3_600_000;
+
+    const live = isClaimLive(row.assigned_user_id, row.assigned_at, observedAt);
+    const holder = live ? row.assigned_user_id : null;
+
     return {
     id: row.id,
     graphExecutionId: row.graph_execution_id,
@@ -152,8 +216,44 @@ export async function getPendingGates(
     outputPayload: row.output_payload ?? {},
     ageHours,
     overdue: ageHours >= REVIEW_SLA_HOURS,
+    claimedBy: holder
+      ? {
+          userId: holder,
+          // `null` means "we could not name them", which the UI states rather
+          // than filling with an id. The viewer's own claim needs no lookup.
+          email: holder === viewerId ? null : (emails.get(holder) ?? null),
+        }
+      : null,
+    claimedAt: holder ? row.assigned_at : null,
+    claimedByMe: holder !== null && holder === viewerId,
+    claimMinutesLeft:
+      holder && row.assigned_at
+        ? Math.max(
+            0,
+            Math.ceil(
+              CLAIM_TTL_MINUTES -
+                (observedAt - new Date(row.assigned_at).getTime()) / 60_000,
+            ),
+          )
+        : null,
     };
   });
+}
+
+/**
+ * Whether a claim still holds, judged from one server-side clock read.
+ *
+ * Mirrors `private.gate_claim_is_live`. Both exist because the count and the
+ * list are answered by different layers; the database is the authority, and
+ * every write re-checks there.
+ */
+function isClaimLive(
+  userId: string | null,
+  assignedAt: string | null,
+  now: number,
+): boolean {
+  if (!userId || !assignedAt) return false;
+  return now - new Date(assignedAt).getTime() < CLAIM_TTL_MINUTES * 60_000;
 }
 
 export async function countPendingGates(workspaceId: string): Promise<number> {
@@ -191,6 +291,28 @@ export async function countOverdueGates(workspaceId: string): Promise<number> {
 
   // A missing badge is better than a dead dashboard. The gates themselves are
   // still listed with their ages on the HITL tab either way.
+  if (error) return 0;
+
+  return Number(data ?? 0);
+}
+
+/**
+ * Overdue gates that nobody is working on.
+ *
+ * The narrower half of `countOverdueGates`, and the actionable one. That count
+ * deliberately still includes claimed gates — a claim is not progress, and a
+ * gate someone took three days ago and never decided has still breached — but
+ * "late and unowned" is the number that tells a reviewer to pick something up.
+ */
+export async function countUnclaimedOverdueGates(
+  workspaceId: string,
+): Promise<number> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase.rpc("unclaimed_overdue_gate_count", {
+    p_workspace_id: workspaceId,
+  });
+
   if (error) return 0;
 
   return Number(data ?? 0);

@@ -3,13 +3,16 @@
 import { useActionState, useState } from "react";
 
 import {
+  claimGate,
   expireGate,
+  releaseGate,
   resolveGate,
   type ExpireState,
   type ResolveDecision,
   type ResolveState,
 } from "@/app/dashboard/actions";
 import type { PendingGate } from "@/lib/data/hitl";
+import { REVIEW_SLA_HOURS } from "@/lib/hitl/review-window";
 import {
   canResolveGates,
   escalationTargets,
@@ -20,6 +23,93 @@ import JsonView from "./JsonView";
 
 const initialState: ResolveState = { error: null, ok: false };
 const expireInitialState: ExpireState = { error: null, message: null };
+
+/**
+ * Who is on this gate, and the control to take or release it.
+ *
+ * The point of the whole mechanism is that a queue of gates addressed to a
+ * ROLE is a queue nobody owns — the open gates here were averaging 89 hours
+ * against 16 for the ones that got decided. A claim does not decide anything;
+ * it says out loud that a person is looking, so two reviewers do not duplicate
+ * the work and an untouched gate is visibly untouched.
+ *
+ * Claims lapse after an hour, and the remaining time is shown rather than
+ * implied. A reviewer who does not know their hold expires would be surprised
+ * by a takeover; one who can see it either finishes or releases.
+ */
+function ClaimControl({ gate }: { gate: PendingGate }) {
+  const [claimState, claimAction, claiming] = useActionState(
+    claimGate,
+    expireInitialState,
+  );
+  const [releaseState, releaseAction, releasing] = useActionState(
+    releaseGate,
+    expireInitialState,
+  );
+
+  const state = claimState.error || claimState.message ? claimState : releaseState;
+
+  // Someone else has it. No control at all — taking a gate off a colleague is
+  // the dispatch behaviour this deliberately does not implement, and the lapse
+  // handles the case where they are gone.
+  if (gate.claimedBy && !gate.claimedByMe) {
+    return (
+      <div className="mt-4 rounded-md border border-slate-700 bg-slate-950 px-3 py-2">
+        <p className="text-xs text-slate-300">
+          Being reviewed by{" "}
+          <span className="font-mono">
+            {gate.claimedBy.email ?? "another reviewer"}
+          </span>
+          .
+        </p>
+        <p className="mt-1 text-[11px] text-slate-500">
+          You can still decide it — a claim is a signal, not a lock. It lapses
+          on its own if they do not come back.
+        </p>
+      </div>
+    );
+  }
+
+  const mine = gate.claimedByMe;
+
+  return (
+    <form
+      action={mine ? releaseAction : claimAction}
+      className="mt-4 flex flex-wrap items-center gap-3 rounded-md border border-slate-700 bg-slate-950 px-3 py-2"
+    >
+      <input type="hidden" name="gateId" value={gate.id} />
+
+      <p className="flex-1 text-[11px] text-slate-400">
+        {mine
+          ? `Yours for another ${gate.claimMinutesLeft ?? 0} minutes.`
+          : "Nobody is on this. Taking it tells the rest of the team you are."}
+      </p>
+
+      <button
+        type="submit"
+        disabled={claiming || releasing}
+        className="rounded-md border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-semibold text-cyan-400 transition-colors hover:bg-cyan-500/20 disabled:opacity-60"
+      >
+        {mine
+          ? releasing
+            ? "Releasing…"
+            : "Release"
+          : claiming
+            ? "Claiming…"
+            : "I'll take this"}
+      </button>
+
+      {(state.error || state.message) && (
+        <p
+          role={state.error ? "alert" : "status"}
+          className={`w-full text-[11px] ${state.error ? "text-rose-400" : "text-emerald-400"}`}
+        >
+          {state.error ?? state.message}
+        </p>
+      )}
+    </form>
+  );
+}
 
 /**
  * The expire control, shown only on a gate that is actually overdue.
@@ -81,9 +171,16 @@ function ExpireGate({ gateId, ageHours }: { gateId: string; ageHours: number }) 
 export default function HitlQueueDashboard({
   gates,
   viewerRole,
+  unclaimedOverdue,
 }: {
   gates: PendingGate[];
   viewerRole: UserRole;
+  /**
+   * Overdue AND unowned. The tab badge counts every overdue gate, because a
+   * claim is not progress and a gate someone took three days ago has still
+   * breached. This is the number that says there is something to pick up.
+   */
+  unclaimedOverdue: number;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(
     gates[0]?.id ?? null,
@@ -124,6 +221,18 @@ export default function HitlQueueDashboard({
                 {gates.length} In Queue
               </span>
             </h2>
+            {unclaimedOverdue > 0 && (
+              /*
+                The one line that turns a queue into a call to act. A gate
+                routed to a role is a gate no particular person owns, which is
+                how the open ones here reached an average of 89 hours against 16
+                for the ones that got decided.
+              */
+              <p className="mt-1 text-[11px] text-amber-400">
+                {unclaimedOverdue} past the {REVIEW_SLA_HOURS}h review window
+                with nobody on {unclaimedOverdue === 1 ? "it" : "them"}.
+              </p>
+            )}
           </div>
         </div>
 
@@ -211,6 +320,20 @@ export default function HitlQueueDashboard({
                         */
                         <span className="ml-2 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-bold text-amber-400">
                           {Math.floor(gate.ageHours)}H UNANSWERED
+                        </span>
+                      )}
+                      {/*
+                        Rendered on the row, not only in the inspector: the
+                        whole value of a claim is that someone scanning the
+                        queue can tell at a glance which gates still need
+                        picking up. Deliberately quiet styling — a claimed gate
+                        is the normal case, not an alert.
+                      */}
+                      {gate.claimedBy && (
+                        <span className="ml-2 rounded border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 text-[10px] font-bold text-cyan-300">
+                          {gate.claimedByMe
+                            ? "YOURS"
+                            : `WITH ${gate.claimedBy.email ?? "another reviewer"}`}
                         </span>
                       )}
                     </span>
@@ -347,6 +470,8 @@ export default function HitlQueueDashboard({
                 <span className="font-mono text-slate-300">{viewerRole}</span>.
               </p>
             )}
+
+            {canResolve && <ClaimControl gate={selectedGate} />}
 
             {selectedGate.overdue && canResolve && (
               <ExpireGate

@@ -261,3 +261,96 @@ export async function expireGate(
 
   return { error: messages[outcome] ?? `Unexpected outcome: ${outcome}`, message: null };
 }
+
+/**
+ * Takes a gate, so the queue shows who is working on it.
+ *
+ * `hitl_approval_gates.assigned_user_id` has existed since migration ...03 and
+ * was written by nothing. The consequence was measurable: gates routed to a
+ * ROLE are gates no particular person owns, and the open ones were averaging
+ * 89 hours against 16 for the ones that got decided.
+ *
+ * A CLAIM, not an assignment. The RBAC blueprint routes gates to roles and says
+ * nothing about directing one at an individual, so nothing here decides who
+ * ought to act — it records who says they are. Claims lapse after an hour so an
+ * abandoned gate returns to the queue.
+ *
+ * No membership pre-check: the RPC is SECURITY INVOKER and the `hitl_resolve`
+ * policy already answers "may you act on this gate", which is exactly the
+ * question. Duplicating it here would be a second copy free to drift from the
+ * authority.
+ */
+export async function claimGate(
+  _prev: ExpireState,
+  formData: FormData,
+): Promise<ExpireState> {
+  const gateId = String(formData.get("gateId") ?? "");
+  if (!gateId) return { error: "No gate selected.", message: null };
+
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("claim_hitl_gate", {
+    p_gate_id: gateId,
+  });
+
+  if (error) return { error: `Could not claim: ${error.message}`, message: null };
+
+  const outcome = (data as string | null) ?? "not_found";
+
+  const messages: Record<string, string> = {
+    claimed: "Yours for the next hour.",
+    already_yours: "You already have this one.",
+    // Deliberately does not name the holder: the queue row already shows it,
+    // and an error message is not the place to introduce a person.
+    held_by_other: "Someone else is reviewing this right now.",
+    not_open: "That gate has already been decided.",
+    // `hitl_select` hides gates above the caller's rank, so a gate they may not
+    // open is indistinguishable from one that does not exist — correctly.
+    not_found: "That gate is not available to you.",
+    forbidden: "Your role cannot act on this gate.",
+  };
+
+  revalidatePath("/dashboard");
+
+  return outcome === "claimed" || outcome === "already_yours"
+    ? { error: null, message: messages[outcome] }
+    : { error: messages[outcome] ?? outcome, message: null };
+}
+
+/**
+ * Gives a gate back to the queue.
+ *
+ * Only the holder may release their own claim. Clearing somebody else's would
+ * be deciding on their behalf that they are not working on something — the
+ * dispatch behaviour this design avoids. A claim held by someone unavailable is
+ * handled by the TTL, which needs nobody's judgement.
+ */
+export async function releaseGate(
+  _prev: ExpireState,
+  formData: FormData,
+): Promise<ExpireState> {
+  const gateId = String(formData.get("gateId") ?? "");
+  if (!gateId) return { error: "No gate selected.", message: null };
+
+  const supabase = await createClient();
+  const { data, error } = await supabase.rpc("release_hitl_gate", {
+    p_gate_id: gateId,
+  });
+
+  if (error) return { error: `Could not release: ${error.message}`, message: null };
+
+  const outcome = (data as string | null) ?? "not_found";
+
+  const messages: Record<string, string> = {
+    released: "Back in the queue.",
+    not_claimed: "Nobody is holding that gate.",
+    not_yours: "That claim is not yours to release.",
+    not_found: "That gate is not available to you.",
+    forbidden: "Your role cannot act on this gate.",
+  };
+
+  revalidatePath("/dashboard");
+
+  return outcome === "released"
+    ? { error: null, message: messages.released }
+    : { error: messages[outcome] ?? outcome, message: null };
+}

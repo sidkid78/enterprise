@@ -30,6 +30,7 @@ import { countActiveExecutions, getRecentExecutions } from "@/lib/data/dag";
 import {
   countOverdueGates,
   countPendingGates,
+  countUnclaimedOverdueGates,
   getDecisionHistory,
   getPendingGates,
 } from "@/lib/data/hitl";
@@ -90,6 +91,11 @@ export default async function EnterpriseDashboardPage({
 
   // Redirects to /login or /onboarding when there is no usable workspace.
   const { active, all } = await resolveActiveWorkspace(requestedWorkspace);
+
+  // The viewer's own id, so a gate claim can be shown as theirs rather than as
+  // somebody's. Read once here rather than per tab.
+  const { data: viewerClaims } = await (await createClient()).auth.getClaims();
+  const viewerId = viewerClaims?.claims?.sub ?? null;
 
   // Header counters are always shown, so they load regardless of active tab.
   const [
@@ -283,8 +289,12 @@ export default async function EnterpriseDashboardPage({
 
         {tab === "hitl" && (
           <HitlQueueDashboard
-            gates={await getPendingGates(active.id)}
+            gates={await getPendingGates(active.id, viewerId)}
             viewerRole={active.role}
+            // Late AND unowned. The tab badge counts every overdue gate,
+            // because a claim is not progress; this is the narrower number
+            // that tells a reviewer there is something to pick up.
+            unclaimedOverdue={await countUnclaimedOverdueGates(active.id)}
           />
         )}
         {tab === "dag" && <DagTab workspaceId={active.id} />}
@@ -309,7 +319,7 @@ export default async function EnterpriseDashboardPage({
           <AccessTab workspaceId={active.id} viewerRole={active.role} />
         )}
         {tab === "upskilling" && (
-          <UpskillingTab workspaceId={active.id} workspaceName={active.name} viewerRole={active.role} />
+          <UpskillingTab workspaceId={active.id} workspaceName={active.name} viewerRole={active.role} viewerId={viewerId} />
         )}
         {tab === "bio" && (
           <div className="space-y-6">
@@ -464,19 +474,17 @@ async function UpskillingTab({
   workspaceId,
   workspaceName,
   viewerRole,
-}: {
-  workspaceId: string;
-  workspaceName: string;
-  viewerRole: string;
-}) {
   // The viewer's own id, so their progress can be separated from the team's.
   // `upskilling_select` returns only their row unless they are an owner or
   // administrator, which is also why `seesEveryone` is passed down rather than
   // inferred from the row count.
-  const supabase = await createClient();
-  const { data: claims } = await supabase.auth.getClaims();
-  const viewerId = claims?.claims?.sub ?? null;
-
+  viewerId,
+}: {
+  workspaceId: string;
+  workspaceName: string;
+  viewerRole: string;
+  viewerId: string | null;
+}) {
   const [modules, runs] = await Promise.all([
     getTrainingModules(workspaceId, viewerId),
     getAttributableRuns(workspaceId),
