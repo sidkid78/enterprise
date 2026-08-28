@@ -1,5 +1,7 @@
 import Link from "next/link";
 
+import { createClient } from "@/lib/supabase/server";
+
 import AccessControlPanel from "@/components/dashboard/AccessControlPanel";
 import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercialization";
 import DecisionHistory from "@/components/dashboard/DecisionHistory";
@@ -467,8 +469,16 @@ async function UpskillingTab({
   workspaceName: string;
   viewerRole: string;
 }) {
+  // The viewer's own id, so their progress can be separated from the team's.
+  // `upskilling_select` returns only their row unless they are an owner or
+  // administrator, which is also why `seesEveryone` is passed down rather than
+  // inferred from the row count.
+  const supabase = await createClient();
+  const { data: claims } = await supabase.auth.getClaims();
+  const viewerId = claims?.claims?.sub ?? null;
+
   const [modules, runs] = await Promise.all([
-    getTrainingModules(workspaceId),
+    getTrainingModules(workspaceId, viewerId),
     getAttributableRuns(workspaceId),
   ]);
 
@@ -480,10 +490,18 @@ async function UpskillingTab({
         sops={modules}
         canEdit={REPORTING_ROLES.includes(viewerRole)}
       />
-      <WorkforceUpskillingHub workspaceName={workspaceName} modules={modules} />
+      <WorkforceUpskillingHub
+        workspaceId={workspaceId}
+        workspaceName={workspaceName}
+        modules={modules}
+        seesEveryone={UPSKILLING_ROSTER_ROLES.includes(viewerRole)}
+      />
     </>
   );
 }
+
+/** Mirrors the `upskilling_select` policy, which is the enforcing copy. */
+const UPSKILLING_ROSTER_ROLES = ["workspace_owner", "ai_administrator"];
 
 async function BioAttributionTab({
   workspaceId,

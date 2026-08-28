@@ -310,24 +310,107 @@ export async function setSopPublished(
 }
 
 /**
- * Records the caller's own progress through an SOP.
+ * Loads a published SOP's steps for validation.
  *
- * Writes the caller's row only — the `upskilling_insert` / `upskilling_update`
- * policies pin user_id to auth.uid(), so this cannot mark a colleague as
- * trained even if the form is tampered with.
+ * Every progress write is checked against the procedure it claims to be
+ * progress through. Without this, a tampered form could store step orders the
+ * SOP does not contain, and the completion percentage — which divides by the
+ * SOP's real step count — would climb past 100% on steps that do not exist.
+ * The read goes through the user-scoped client, so RLS also confirms the SOP is
+ * one the caller may see.
  */
-export async function updateOwnProgress(
+async function sopStepOrders(
+  supabase: Awaited<ReturnType<typeof createClient>>,
+  workspaceId: string,
+  sopId: string,
+): Promise<Set<number> | null> {
+  const { data } = await supabase
+    .from("workforce_sop_templates")
+    .select("sop_content")
+    .eq("id", sopId)
+    .eq("workspace_id", workspaceId)
+    .maybeSingle();
+
+  const steps = (data as { sop_content?: { steps?: { order: number }[] } } | null)
+    ?.sop_content?.steps;
+
+  if (!steps) return null;
+  return new Set(steps.map((s) => s.order));
+}
+
+/**
+ * Starts the caller on a procedure.
+ *
+ * Enrollment is the existence of the row, so this writes an empty one. Someone
+ * who has opened a procedure and completed none of it is a real state, and the
+ * one a supervisor most wants to see — folding it into the first tick would
+ * make "started but stalled" indistinguishable from "never opened".
+ *
+ * Writes the caller's row only: `upskilling_insert` pins `user_id` to
+ * `auth.uid()`, so this cannot enroll a colleague even if the form is
+ * tampered with.
+ */
+export async function enrollInSop(
   _prev: OutcomeState,
   formData: FormData,
 ): Promise<OutcomeState> {
   const workspaceId = String(formData.get("workspaceId") ?? "");
   const sopId = String(formData.get("sopId") ?? "");
-  const completed = Number(formData.get("completedModules") ?? 0);
-  const total = Number(formData.get("totalModules") ?? 0);
 
   if (!sopId) return { error: "No procedure selected.", message: null };
-  if (!Number.isFinite(completed) || completed < 0) {
-    return { error: "Invalid progress value.", message: null };
+
+  const supabase = await createClient();
+
+  const { data: claims } = await supabase.auth.getClaims();
+  const userId = claims?.claims?.sub;
+  if (!userId) return { error: "Not signed in.", message: null };
+
+  if (!(await sopStepOrders(supabase, workspaceId, sopId))) {
+    return { error: "That procedure is not in this workspace.", message: null };
+  }
+
+  const { error } = await supabase.from("user_upskilling_progress").upsert(
+    {
+      workspace_id: workspaceId,
+      user_id: userId,
+      sop_id: sopId,
+      last_active_at: new Date().toISOString(),
+    },
+    // Re-opening a procedure must never reset the ticks already recorded.
+    { onConflict: "user_id,sop_id", ignoreDuplicates: true },
+  );
+
+  if (error) return { error: error.message, message: null };
+
+  revalidatePath("/dashboard");
+  return { error: null, message: "Started." };
+}
+
+/**
+ * Marks one step of a procedure done, or undone.
+ *
+ * Records WHICH steps rather than how many. A count cannot answer the question
+ * a supervisor actually asks — not "how far through are they" but "have they
+ * done the step that needs a human" — and `SopStep.requiredHuman` is carried
+ * through from the run precisely so that step can be pointed at.
+ *
+ * Read-modify-write on a jsonb array, which is safe here in a way it was not
+ * for `record_spend`: the row is scoped to one person and one procedure, so the
+ * only writer racing with it is the same human in two tabs. The cost of losing
+ * that race is a tick that has to be clicked again, not a lost charge.
+ */
+export async function setSopStepDone(
+  _prev: OutcomeState,
+  formData: FormData,
+): Promise<OutcomeState> {
+  const workspaceId = String(formData.get("workspaceId") ?? "");
+  const sopId = String(formData.get("sopId") ?? "");
+  const step = Number(formData.get("stepOrder"));
+  const done = String(formData.get("done") ?? "") === "true";
+
+  if (!sopId) return { error: "No procedure selected.", message: null };
+  if (!Number.isInteger(step)) {
+    return { error: "Invalid step.", message: null };
   }
 
   const supabase = await createClient();
@@ -336,15 +419,37 @@ export async function updateOwnProgress(
   const userId = claims?.claims?.sub;
   if (!userId) return { error: "Not signed in.", message: null };
 
-  const totalModules = Number.isFinite(total) && total > 0 ? total : 1;
+  const orders = await sopStepOrders(supabase, workspaceId, sopId);
+  if (!orders) {
+    return { error: "That procedure is not in this workspace.", message: null };
+  }
+  if (!orders.has(step)) {
+    return { error: "That step is not part of this procedure.", message: null };
+  }
+
+  const { data: existing } = await supabase
+    .from("user_upskilling_progress")
+    .select("completed_steps")
+    .eq("sop_id", sopId)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  const current = new Set<number>(
+    ((existing as { completed_steps?: number[] } | null)?.completed_steps ?? [])
+      // Drop anything the procedure no longer contains, so an old tick cannot
+      // survive into a count it does not belong to.
+      .filter((order) => orders.has(order)),
+  );
+
+  if (done) current.add(step);
+  else current.delete(step);
 
   const { error } = await supabase.from("user_upskilling_progress").upsert(
     {
       workspace_id: workspaceId,
       user_id: userId,
       sop_id: sopId,
-      completed_modules: Math.min(completed, totalModules),
-      total_modules: totalModules,
+      completed_steps: [...current].sort((a, b) => a - b),
       last_active_at: new Date().toISOString(),
     },
     { onConflict: "user_id,sop_id" },
