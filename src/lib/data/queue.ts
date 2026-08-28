@@ -68,7 +68,10 @@ export async function getQueueHealth(
     .from("agent_job_queue")
     .select(SELECT)
     .eq("workspace_id", workspaceId)
-    .neq("status", "succeeded")
+    // Both terminal, and neither needs an operator. A cancelled job was ended
+    // deliberately and cannot be resumed; its record lives in the ledger as
+    // `job_cancelled`, not in a panel about work still to be done.
+    .not("status", "in", "(succeeded,cancelled)")
     .order("updated_at", { ascending: false })
     .limit(limit * 3);
 

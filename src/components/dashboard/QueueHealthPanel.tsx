@@ -2,7 +2,11 @@
 
 import { useActionState } from "react";
 
-import { requeueJob, type RequeueState } from "@/app/dashboard/queue-actions";
+import {
+  cancelJob,
+  requeueJob,
+  type RequeueState,
+} from "@/app/dashboard/queue-actions";
 import {
   isLeaseExpired,
   isWorkerStale,
@@ -189,6 +193,66 @@ function RetryButton({
   );
 }
 
+/**
+ * Ends a run for good.
+ *
+ * Styled as the quieter of the two controls and never as the primary action:
+ * retrying is recoverable and this is not, so the destructive one should not be
+ * the easier thing to hit.
+ *
+ * The reason box is optional but offered every time. It is the only place the
+ * operator can say WHY the work was abandoned — `last_error` says why the job
+ * stopped progressing, which is a different question — and both the job row and
+ * the `job_cancelled` ledger entry keep what is typed here.
+ */
+function CancelButton({
+  workspaceId,
+  jobId,
+  compact = false,
+}: {
+  workspaceId: string;
+  jobId: string;
+  compact?: boolean;
+}) {
+  const [state, formAction, pending] = useActionState(cancelJob, initialState);
+
+  return (
+    <form action={formAction} className="shrink-0 text-right">
+      <input type="hidden" name="workspaceId" value={workspaceId} />
+      <input type="hidden" name="jobId" value={jobId} />
+
+      <div className="flex items-center justify-end gap-2">
+        <input
+          type="text"
+          name="reason"
+          placeholder="reason (optional)"
+          className={`rounded-md border border-slate-700 bg-slate-950 px-2 py-1 text-[11px] text-slate-300 placeholder:text-slate-600 focus:border-slate-500 focus:outline-none ${
+            compact ? "w-32" : "w-44"
+          }`}
+        />
+        <button
+          type="submit"
+          disabled={pending}
+          className="rounded-md border border-slate-700 px-2.5 py-1.5 text-xs font-semibold text-slate-400 transition-colors hover:border-rose-500/40 hover:text-rose-400 disabled:opacity-60"
+        >
+          {pending ? "Cancelling…" : "Cancel"}
+        </button>
+      </div>
+
+      {(state.error || state.message) && (
+        <p
+          role={state.error ? "alert" : "status"}
+          className={`mt-2 max-w-[18rem] text-[11px] ${
+            state.error ? "text-rose-400" : "text-emerald-400"
+          }`}
+        >
+          {state.error ?? state.message}
+        </p>
+      )}
+    </form>
+  );
+}
+
 function DeadLetter({
   job,
   workspaceId,
@@ -233,14 +297,35 @@ function DeadLetter({
           )}
         </div>
 
-        {canRetry && <RetryButton workspaceId={workspaceId} jobId={job.id} />}
+        {canRetry && (
+          <div className="flex shrink-0 flex-col items-end gap-2">
+            <RetryButton workspaceId={workspaceId} jobId={job.id} />
+            <CancelButton workspaceId={workspaceId} jobId={job.id} />
+          </div>
+        )}
       </div>
     </li>
   );
 }
 
-function ActiveRow({ job, now }: { job: QueueJob; now: number }) {
+function ActiveRow({
+  job,
+  now,
+  workspaceId,
+  canCancel,
+}: {
+  job: QueueJob;
+  now: number;
+  workspaceId: string;
+  canCancel: boolean;
+}) {
   const expired = isLeaseExpired(job, now);
+
+  // A live worker holds this one and will write its own ending; offering a
+  // control the RPC would refuse is worse than offering none. A queued job, or
+  // a running one whose worker died holding the lease, has nobody coming for
+  // it — those are exactly the ones a person has to end.
+  const endable = canCancel && (job.status === "queued" || expired);
 
   return (
     <li className="flex items-center justify-between gap-4 border-b border-slate-800 py-2 last:border-0">
@@ -279,6 +364,10 @@ function ActiveRow({ job, now }: { job: QueueJob; now: number }) {
           <span className="text-slate-500">waiting for a worker</span>
         )}
       </div>
+
+      {endable && (
+        <CancelButton workspaceId={workspaceId} jobId={job.id} compact />
+      )}
     </li>
   );
 }
@@ -286,10 +375,14 @@ function ActiveRow({ job, now }: { job: QueueJob; now: number }) {
 /**
  * Queue state an operator has to act on.
  *
- * Dead letters lead, because they are the only part of the queue that will
- * never resolve itself. Everything else here is informational: a queued job is
- * waiting, a leased job is being worked, and an expired lease is reclaimed on
- * the next poll without anyone doing anything.
+ * Dead letters lead, because a run the queue gave up on needs a decision.
+ *
+ * The rest used to be purely informational, on the reasoning that a queued job
+ * is waiting, a leased job is being worked, and an expired lease is reclaimed on
+ * the next poll without anyone doing anything. Each of those is true only while
+ * a worker exists to do it. With an empty fleet a queued job waits forever, and
+ * the panel showed it with nothing attached — so queued and lease-expired rows
+ * now carry a cancel control.
  */
 export default function QueueHealthPanel({
   workspaceId,
@@ -355,7 +448,13 @@ export default function QueueHealthPanel({
           </p>
           <ul>
             {active.map((job) => (
-              <ActiveRow key={job.id} job={job} now={now} />
+              <ActiveRow
+                key={job.id}
+                job={job}
+                now={now}
+                workspaceId={workspaceId}
+                canCancel={canRetry}
+              />
             ))}
           </ul>
         </div>
