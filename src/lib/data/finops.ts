@@ -96,3 +96,68 @@ export async function getRunSpend(
 
   return new Map(entries);
 }
+
+/**
+ * What the cost controls actually did, over the last seven days.
+ *
+ * Every field is counted from rows written as work happened. There is
+ * deliberately no projected spend, no savings rate and no annualised figure:
+ * those are forecasts, and this platform does not render forecasts next to
+ * measurements — the same rule that keeps ROI out of the runtime's hands.
+ */
+export type FinopsSummary = {
+  windowHours: number;
+  totalSpendUsd: number;
+  modelCalls: number;
+  cacheHits: number;
+  /**
+   * Hits whose cached entry had a recorded production cost.
+   *
+   * Distinct from `cacheHits` on purpose. Entries written before migration
+   * `…27` carry no cost, so they are real hits that contribute nothing to the
+   * money figure. Showing one number for both would overstate the priced
+   * evidence or understate the cache's work, depending which you picked.
+   */
+  cacheHitsPriced: number;
+  /** Measured: what those answers cost when they were first produced. */
+  avoidedCostUsd: number;
+  avoidedTokens: number;
+  cheapCalls: number;
+  defaultCalls: number;
+  reasoningCalls: number;
+  criticCalls: number;
+  totalTokens: number;
+};
+
+export async function getFinopsSummary(
+  workspaceId: string,
+): Promise<FinopsSummary | null> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase.rpc("workspace_finops_summary", {
+    p_workspace_id: workspaceId,
+    p_window_hours: 168,
+  });
+
+  if (error) {
+    throw new Error(`Failed to load FinOps summary: ${error.message}`);
+  }
+
+  const row = (data as Record<string, unknown>[] | null)?.[0];
+  if (!row) return null;
+
+  return {
+    windowHours: Number(row.window_hours ?? 168),
+    totalSpendUsd: Number(row.total_spend_usd ?? 0),
+    modelCalls: Number(row.model_calls ?? 0),
+    cacheHits: Number(row.cache_hits ?? 0),
+    cacheHitsPriced: Number(row.cache_hits_priced ?? 0),
+    avoidedCostUsd: Number(row.avoided_cost_usd ?? 0),
+    avoidedTokens: Number(row.avoided_tokens ?? 0),
+    cheapCalls: Number(row.cheap_calls ?? 0),
+    defaultCalls: Number(row.default_calls ?? 0),
+    reasoningCalls: Number(row.reasoning_calls ?? 0),
+    criticCalls: Number(row.critic_calls ?? 0),
+    totalTokens: Number(row.total_tokens ?? 0),
+  };
+}

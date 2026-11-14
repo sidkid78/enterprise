@@ -8,13 +8,12 @@ export type Member = {
   role: UserRole;
   joinedAt: string;
   /**
-   * Null whenever the viewer may not read the address.
+   * Null only when the directory lookup was refused or the account is gone.
    *
-   * `authenticated` cannot select from auth.users, so a member's email is only
-   * available where the platform already holds it — the invitation that
-   * created them. For a founder-created workspace there is no invitation and
-   * this is simply unknown, which is a truer thing to render than a blank
-   * pretending to be an empty address.
+   * `authenticated` cannot select from auth.users directly; this comes from
+   * `workspace_member_directory`, a DEFINER RPC that checks membership
+   * internally (migration `…28`). Before it existed the roster rendered raw
+   * uuids, which is not an identity anyone can act on.
    */
   email: string | null;
 };
@@ -39,6 +38,7 @@ export type Invitation = {
  */
 export async function getMembers(workspaceId: string): Promise<Member[]> {
   const supabase = await createClient();
+  const directory = await getMemberDirectory(workspaceId);
 
   const { data, error } = await supabase
     .from("workspace_members")
@@ -56,7 +56,7 @@ export async function getMembers(workspaceId: string): Promise<Member[]> {
     userId: row.user_id,
     role: row.role,
     joinedAt: row.created_at,
-    email: null,
+    email: directory.get(row.user_id) ?? null,
   }));
 }
 
@@ -103,4 +103,36 @@ export async function getInvitations(
     createdAt: row.created_at,
     expired: new Date(row.expires_at).getTime() <= now,
   }));
+}
+
+/**
+ * user_id → email for the people in a workspace.
+ *
+ * `authenticated` cannot read `auth.users`, so this goes through a
+ * SECURITY DEFINER RPC that checks membership internally (migration `…28`).
+ * It is not the email-existence oracle invitations were built to avoid: that
+ * would answer "does an account exist for this address?" for any address a
+ * caller invents, whereas this names people already on a roster the caller can
+ * enumerate. It adds no membership information, only the name on a visible row.
+ *
+ * Returns an empty map rather than throwing. A decision log that renders
+ * "approved by c91ea881" is degraded; one that fails to render is worse.
+ */
+export async function getMemberDirectory(
+  workspaceId: string,
+): Promise<Map<string, string>> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase.rpc("workspace_member_directory", {
+    p_workspace_id: workspaceId,
+  });
+
+  if (error) return new Map();
+
+  return new Map(
+    ((data ?? []) as { user_id: string; email: string }[]).map((row) => [
+      row.user_id,
+      row.email,
+    ]),
+  );
 }

@@ -315,6 +315,68 @@ async function recordLedger(
   });
 }
 
+/**
+ * Longest prose a single transcript row keeps.
+ *
+ * Generous, because truncating an audit record defeats its purpose, but not
+ * unbounded: a node whose retrieval returned a dozen parent documents can
+ * compose a very large input, and one run should not be able to write megabytes
+ * into a table every member reads. Truncation is recorded on the row rather
+ * than silently applied, so a reader can tell a short prompt from a clipped one.
+ */
+const MESSAGE_TEXT_LIMIT = 12_000;
+
+/**
+ * Records one turn of the conversation between agents.
+ *
+ * `content` is ALWAYS post-masking — see migration `…25`. This table is
+ * readable by every workspace member, unlike the ledger, so writing a raw
+ * prompt here would widen unmasked PII from three roles to everyone.
+ *
+ * Never throws and never blocks the run. A missing transcript row is a gap in
+ * the record; a failed run because the record could not be written is a gap in
+ * the work. The ledger already carries the fact that the step happened, so the
+ * consequential trail survives either way.
+ */
+async function recordMessage(
+  db: Db,
+  entry: {
+    workspaceId: string;
+    graphExecutionId: string;
+    nodeExecutionId?: string | null;
+    from: string;
+    to: string;
+    type: string;
+    text?: string;
+    payload?: Record<string, unknown>;
+  },
+) {
+  const content: Record<string, unknown> = { ...(entry.payload ?? {}) };
+
+  if (entry.text !== undefined) {
+    const truncated = entry.text.length > MESSAGE_TEXT_LIMIT;
+    content.text = truncated
+      ? entry.text.slice(0, MESSAGE_TEXT_LIMIT)
+      : entry.text;
+    content.chars = entry.text.length;
+    content.truncated = truncated;
+  }
+
+  const { error } = await db.from("agent_messages").insert({
+    workspace_id: entry.workspaceId,
+    graph_execution_id: entry.graphExecutionId,
+    node_execution_id: entry.nodeExecutionId ?? null,
+    sender_agent: entry.from,
+    recipient_agent: entry.to,
+    message_type: entry.type,
+    content,
+  });
+
+  if (error) {
+    console.error(`Could not record agent message: ${error.message}`);
+  }
+}
+
 /** Writes a row to the governance audit trail for one gate evaluation. */
 async function recordGuardrail(
   db: Db,
@@ -945,6 +1007,30 @@ async function executePending(
         });
       }
 
+      // The transcript entry for this step, written BEFORE the cache lookup.
+      //
+      // What the node was told is the same text whether a model call or the
+      // cache answered it, and recording only the model path would leave a
+      // cached node looking like one nobody ever briefed. `maskedInput` is the
+      // exact string that crosses the boundary, which is why it is the string
+      // kept — see migration ...25.
+      await recordMessage(db, {
+        workspaceId,
+        graphExecutionId: graphId,
+        nodeExecutionId: node.id,
+        from: "Orchestrator",
+        to: node.agent_role,
+        type: "task_assignment",
+        text: maskedInput,
+        payload: {
+          node_id: node.node_id,
+          model: model,
+          retrieved_chunks: retrieval.chunks.length,
+          tools_available: workspaceTools.length,
+          pii_masked: piiMatches.length,
+        },
+      });
+
       // === FinOps: semantic cache before spending on a model call =====
       // Keyed on the masked text, so the cache never stores raw PII.
       const cached = await lookupCache(db, workspaceId, maskedInput, graphId);
@@ -1136,6 +1222,34 @@ async function executePending(
         }
       }
 
+      // The other half of the transcript: what came back.
+      //
+      // Written before the gates run, so the record shows what the agent
+      // actually said even when a gate then rejects it. A transcript that only
+      // kept committable answers would be missing precisely the turns an
+      // auditor is looking for — the unparseable one, the low-confidence one,
+      // the one the critic threw out.
+      await recordMessage(db, {
+        workspaceId,
+        graphExecutionId: graphId,
+        nodeExecutionId: node.id,
+        from: node.agent_role,
+        to: "Orchestrator",
+        type: cached ? "task_result_cached" : "task_result",
+        // The worker's own prose. Its structured result lives on the node row;
+        // duplicating it here would double the storage of every deliverable.
+        text: output?.summary ?? "(no parseable output)",
+        payload: {
+          node_id: node.node_id,
+          confidence: output?.confidence ?? null,
+          from_cache: !!cached,
+          tool_calls: toolCalls.length,
+          interaction_id: interactionId,
+          monetary_value_usd: output?.monetary_value_usd ?? null,
+          sentiment_score: output?.sentiment_score ?? null,
+        },
+      });
+
       // === GATE 2: structural validation ==============================
       // response_format constrains the shape but does not guarantee it; a
       // truncated or refused response still has to be caught here.
@@ -1171,6 +1285,12 @@ async function executePending(
         cached_tokens: usage.cachedTokens,
         estimated_cost_usd: cost,
         routing_tier: routingTier,
+        // Recorded only on a hit, and never in estimated_cost_usd: that column
+        // is summed by run_spend_summary, record_spend and the budget gate, so
+        // an avoided cost booked there would inflate real spend and could halt
+        // a workspace for money it did not spend.
+        avoided_cost_usd: cached?.producedCostUsd ?? 0,
+        avoided_tokens: cached?.producedTokens ?? 0,
       });
 
       // === GATE 3: critic review ======================================
@@ -1326,6 +1446,13 @@ async function executePending(
           responsePayload: output as unknown as Record<string, unknown>,
           modelUsed: model,
           graphExecutionId: graphId,
+          // What this answer cost to produce. A later hit reports exactly this
+          // number as the cost it avoided, which makes the saving a
+          // measurement of a real past call rather than a guess about a
+          // hypothetical one.
+          promptTokens: usage.inputTokens,
+          completionTokens: usage.outputTokens,
+          costUsd: cost,
         });
       }
 
@@ -1593,10 +1720,26 @@ export async function runGraph(graphExecutionId: string): Promise<RunResult> {
     );
   }
 
+  const planInput = `Decompose this enterprise task into at most ${nodeBudget} DAG steps:\n\n${maskedRoot}`;
+
+  // The first turn of the transcript. The plan decides what every later step is
+  // told, so an auditor tracing a bad conclusion back through the nodes ends up
+  // here — and `root_prompt` alone does not show it, because what the planner
+  // saw was the MASKED prompt wrapped in a decomposition instruction.
+  await recordMessage(db, {
+    workspaceId,
+    graphExecutionId: graphId,
+    from: "Requester",
+    to: "Orchestrator",
+    type: "plan_request",
+    text: planInput,
+    payload: { node_budget: nodeBudget, pii_masked: rootPii.length },
+  });
+
   try {
     const planInteraction = await client.interactions.create({
       model: MODEL_TIERS.cheap,
-      input: `Decompose this enterprise task into at most ${nodeBudget} DAG steps:\n\n${maskedRoot}`,
+      input: planInput,
       system_instruction:
         "You are a decomposition orchestrator for an enterprise multi-agent platform. Produce the smallest plan that fully covers the task, and assign the cheapest tier that can do each step.",
       response_format: {
@@ -1641,6 +1784,32 @@ export async function runGraph(graphExecutionId: string): Promise<RunResult> {
         depends_on: Array.isArray(s.depends_on) ? s.depends_on : [],
         tier: isModelTier(s.tier) ? s.tier : ("default" as ModelTier),
       }));
+
+    await recordMessage(db, {
+      workspaceId,
+      graphExecutionId: graphId,
+      from: "Orchestrator",
+      to: "Requester",
+      type: "plan_result",
+      text: steps
+        .map(
+          (st) =>
+            `${st.node_id} [${st.agent_role}, ${st.tier}]${
+              st.depends_on.length ? ` after ${st.depends_on.join(", ")}` : ""
+            }${st.requires_hitl_check ? " (gated)" : ""}: ${st.objective ?? ""}`,
+        )
+        .join("\n"),
+      payload: {
+        step_count: steps.length,
+        interaction_id: planInteraction.id,
+        // The planner's gating judgement, recorded where it was made. A resume
+        // gates on this same decision, so a reader can check the gate against
+        // the reason it exists rather than inferring it from the node row.
+        gated_steps: steps
+          .filter((st) => st.requires_hitl_check)
+          .map((st) => st.node_id),
+      },
+    });
 
     if (steps.length === 0) {
       return await markFailed(db, graphId, "Decomposition produced no usable steps.");
@@ -1915,7 +2084,13 @@ export async function resumeGraph(graphExecutionId: string): Promise<RunResult> 
 
   const { data: gate } = await db
     .from("hitl_approval_gates")
-    .select("id, status, node_execution_id, output_payload, human_feedback")
+    // resolved_by/resolved_at come along so the ledger can name the person.
+    // The worker runs as service_role and has no session, so identity cannot
+    // come from the caller — it comes from the gate row the reviewer wrote,
+    // which is also the only record that survives a queue hop.
+    .select(
+      "id, status, node_execution_id, output_payload, human_feedback, resolved_by, resolved_at, required_role",
+    )
     .eq("graph_execution_id", graphExecutionId)
     .order("created_at", { ascending: false })
     .limit(1)
@@ -1948,7 +2123,16 @@ export async function resumeGraph(graphExecutionId: string): Promise<RunResult> 
       nodeExecutionId: gate.node_execution_id,
       agentId: "HumanReviewer",
       actionType: "hitl_rejection",
-      payload: { gate_id: gate.id, feedback: gate.human_feedback ?? null },
+      payload: {
+        gate_id: gate.id,
+        feedback: gate.human_feedback ?? null,
+        // WHO. The blueprint's RBAC doc puts the operator's id in the chain,
+        // and without it the ledger's answer to "who rejected this run" is the
+        // constant string "HumanReviewer".
+        operator_id: gate.resolved_by ?? null,
+        resolved_at: gate.resolved_at ?? null,
+        required_role: gate.required_role ?? null,
+      },
     });
 
     return {
@@ -2047,7 +2231,16 @@ export async function resumeGraph(graphExecutionId: string): Promise<RunResult> 
     nodeExecutionId: gate.node_execution_id,
     agentId: "HumanReviewer",
     actionType: "hitl_approval",
-    payload: { gate_id: gate.id, feedback: gate.human_feedback ?? null },
+    payload: {
+      gate_id: gate.id,
+      feedback: gate.human_feedback ?? null,
+      operator_id: gate.resolved_by ?? null,
+      resolved_at: gate.resolved_at ?? null,
+      // The bar the gate actually carried when it was cleared. An escalated
+      // gate is resolved at a higher rank than it was raised at, and an
+      // auditor needs the rank that was satisfied, not today's value.
+      required_role: gate.required_role ?? null,
+    },
   });
 
   await db

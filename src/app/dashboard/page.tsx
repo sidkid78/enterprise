@@ -1,7 +1,11 @@
 import Link from "next/link";
 
+import { createClient } from "@/lib/supabase/server";
+
 import AccessControlPanel from "@/components/dashboard/AccessControlPanel";
 import BioRoiCommercialization from "@/components/dashboard/BioRoiCommercialization";
+import DecisionHistory from "@/components/dashboard/DecisionHistory";
+import FinopsPanel from "@/components/dashboard/FinopsPanel";
 import GovernanceControlPlane from "@/components/dashboard/GovernanceControlPlane";
 import KnowledgeBaseHub from "@/components/dashboard/KnowledgeBaseHub";
 import McpToolRegistry from "@/components/dashboard/McpToolRegistry";
@@ -23,7 +27,13 @@ import {
   getSlaCredit,
 } from "@/lib/data/bio";
 import { countActiveExecutions, getRecentExecutions } from "@/lib/data/dag";
-import { countPendingGates, getPendingGates } from "@/lib/data/hitl";
+import {
+  countOverdueGates,
+  countPendingGates,
+  countUnclaimedOverdueGates,
+  getDecisionHistory,
+  getPendingGates,
+} from "@/lib/data/hitl";
 import {
   getKnowledgeBases,
   getKnowledgeDocuments,
@@ -35,14 +45,19 @@ import {
   verifyLedgerChain,
   LEDGER_ROLES,
 } from "@/lib/data/governance";
-import { getBudgetStatus } from "@/lib/data/finops";
+import { getBudgetStatus, getFinopsSummary } from "@/lib/data/finops";
 import { getMcpServers, getMcpTools } from "@/lib/data/mcp";
 import {
   countDeadLetters,
   getQueueHealth,
   getWorkerFleet,
 } from "@/lib/data/queue";
-import { getInvitations, getMembers } from "@/lib/data/members";
+import {
+  getInvitations,
+  getMemberDirectory,
+  getMembers,
+} from "@/lib/data/members";
+import { getAgentMessages } from "@/lib/data/messages";
 import { getTrainingModules } from "@/lib/data/workforce";
 import { getUserClaims, resolveActiveWorkspace } from "@/lib/data/workspaces";
 import { ROLE_POWER, type UserRole } from "@/lib/roles";
@@ -77,8 +92,20 @@ export default async function EnterpriseDashboardPage({
   // Redirects to /login or /onboarding when there is no usable workspace.
   const { active, all } = await resolveActiveWorkspace(requestedWorkspace);
 
+  // The viewer's own id, so a gate claim can be shown as theirs rather than as
+  // somebody's. Read once here rather than per tab.
+  const { data: viewerClaims } = await (await createClient()).auth.getClaims();
+  const viewerId = viewerClaims?.claims?.sub ?? null;
+
   // Header counters are always shown, so they load regardless of active tab.
-  const [pendingHitlCount, activeDagRuns, roi, budget, deadLetterCount] =
+  const [
+    pendingHitlCount,
+    activeDagRuns,
+    roi,
+    budget,
+    deadLetterCount,
+    overdueGateCount,
+  ] =
     await Promise.all([
       countPendingGates(active.id),
       countActiveExecutions(active.id),
@@ -88,6 +115,10 @@ export default async function EnterpriseDashboardPage({
       // invisible otherwise, which is the whole failure this counter exists to
       // prevent. An operator should not have to go looking for it.
       countDeadLetters(active.id),
+      // Also on every tab. A gate nobody answers is the quietest failure in the
+      // product: it holds no worker, blocks no queue and raises no error, while
+      // the run behind it stays frozen. One had been waiting 111 hours.
+      countOverdueGates(active.id),
     ]);
 
   const tabHref = (key: TabKey) =>
@@ -231,6 +262,11 @@ export default async function EnterpriseDashboardPage({
                       {pendingHitlCount}
                     </span>
                   )}
+                  {key === "hitl" && overdueGateCount > 0 && (
+                    <span className="ml-1 rounded-full border border-rose-500/40 bg-rose-500/20 px-2 py-0.5 text-xs font-bold text-rose-400">
+                      {overdueGateCount} overdue
+                    </span>
+                  )}
                   {key === "governance" && deadLetterCount > 0 && (
                     <span className="ml-2 rounded-full border border-rose-500/40 bg-rose-500/20 px-2 py-0.5 text-xs font-bold text-rose-400">
                       {deadLetterCount} stalled
@@ -253,13 +289,15 @@ export default async function EnterpriseDashboardPage({
 
         {tab === "hitl" && (
           <HitlQueueDashboard
-            gates={await getPendingGates(active.id)}
+            gates={await getPendingGates(active.id, viewerId)}
             viewerRole={active.role}
+            // Late AND unowned. The tab badge counts every overdue gate,
+            // because a claim is not progress; this is the narrower number
+            // that tells a reviewer there is something to pick up.
+            unclaimedOverdue={await countUnclaimedOverdueGates(active.id)}
           />
         )}
-        {tab === "dag" && (
-          <DagTraceVisualizer executions={await getRecentExecutions(active.id)} />
-        )}
+        {tab === "dag" && <DagTab workspaceId={active.id} />}
         {tab === "knowledge" && (
           <KnowledgeBaseHub
             workspaceId={active.id}
@@ -281,11 +319,18 @@ export default async function EnterpriseDashboardPage({
           <AccessTab workspaceId={active.id} viewerRole={active.role} />
         )}
         {tab === "upskilling" && (
-          <UpskillingTab workspaceId={active.id} workspaceName={active.name} viewerRole={active.role} />
+          <UpskillingTab workspaceId={active.id} workspaceName={active.name} viewerRole={active.role} viewerId={viewerId} />
         )}
         {tab === "bio" && (
           <div className="space-y-6">
             <BioRoiCommercialization workspaceName={active.name} roi={roi} />
+            {/*
+              FinOps sits on this tab rather than getting its own: gross margin
+              is deflected cost minus compute cost, and compute cost is exactly
+              what the cascade and the cache are defending. Splitting them
+              across tabs would separate a number from its explanation.
+            */}
+            <FinopsPanel finops={await getFinopsSummary(active.id)} />
             <SlaBillingPanel credit={await getSlaCredit(active.id)} />
             <BioAttributionTab workspaceId={active.id} viewerRole={active.role} />
           </div>
@@ -311,6 +356,30 @@ export default async function EnterpriseDashboardPage({
  * `canManage` only decides whether to render controls that would otherwise
  * fail.
  */
+/**
+ * The DAG tab and its transcripts.
+ *
+ * Transcripts are fetched for every execution shown rather than for the
+ * selected one, because which execution is selected is client state and a
+ * server component cannot see it. Five runs of a handful of turns each is a
+ * small enough read to prefer over a round trip on every selection.
+ */
+async function DagTab({ workspaceId }: { workspaceId: string }) {
+  const executions = await getRecentExecutions(workspaceId);
+
+  const transcripts = Object.fromEntries(
+    await Promise.all(
+      executions.map(
+        async (e) => [e.id, await getAgentMessages(e.id)] as const,
+      ),
+    ),
+  );
+
+  return (
+    <DagTraceVisualizer executions={executions} transcripts={transcripts} />
+  );
+}
+
 async function AccessTab({
   workspaceId,
   viewerRole,
@@ -350,7 +419,12 @@ async function GovernanceTab({
 }) {
   const canReadLedger = LEDGER_ROLES.includes(viewerRole);
 
-  const [events, ledger, verification, queue, workers] = await Promise.all([
+  // Identities first: the decision log needs the directory to name a resolver,
+  // and rendering a raw uuid would be worse than not rendering the column.
+  const directory = await getMemberDirectory(workspaceId);
+
+  const [events, ledger, verification, queue, workers, decisions] =
+    await Promise.all([
     getGuardrailEvents(workspaceId),
     canReadLedger ? getLedgerEntries(workspaceId) : Promise.resolve([]),
     canReadLedger ? verifyLedgerChain(workspaceId) : Promise.resolve(null),
@@ -361,10 +435,17 @@ async function GovernanceTab({
     // Fleet-wide, not workspace-scoped: one worker drains every tenant, so
     // "is anything running?" has the same answer for all of them.
     getWorkerFleet(),
+    getDecisionHistory(workspaceId, directory),
   ]);
 
   return (
     <>
+      {/*
+        Above the guardrail feed: the human decisions are the part of the audit
+        trail a compliance reader comes for, and the automated gates are the
+        supporting evidence.
+      */}
+      <DecisionHistory decisions={decisions} />
       <QueueHealthPanel
         workspaceId={workspaceId}
         health={queue}
@@ -393,13 +474,19 @@ async function UpskillingTab({
   workspaceId,
   workspaceName,
   viewerRole,
+  // The viewer's own id, so their progress can be separated from the team's.
+  // `upskilling_select` returns only their row unless they are an owner or
+  // administrator, which is also why `seesEveryone` is passed down rather than
+  // inferred from the row count.
+  viewerId,
 }: {
   workspaceId: string;
   workspaceName: string;
   viewerRole: string;
+  viewerId: string | null;
 }) {
   const [modules, runs] = await Promise.all([
-    getTrainingModules(workspaceId),
+    getTrainingModules(workspaceId, viewerId),
     getAttributableRuns(workspaceId),
   ]);
 
@@ -411,10 +498,18 @@ async function UpskillingTab({
         sops={modules}
         canEdit={REPORTING_ROLES.includes(viewerRole)}
       />
-      <WorkforceUpskillingHub workspaceName={workspaceName} modules={modules} />
+      <WorkforceUpskillingHub
+        workspaceId={workspaceId}
+        workspaceName={workspaceName}
+        modules={modules}
+        seesEveryone={UPSKILLING_ROSTER_ROLES.includes(viewerRole)}
+      />
     </>
   );
 }
+
+/** Mirrors the `upskilling_select` policy, which is the enforcing copy. */
+const UPSKILLING_ROSTER_ROLES = ["workspace_owner", "ai_administrator"];
 
 async function BioAttributionTab({
   workspaceId,
